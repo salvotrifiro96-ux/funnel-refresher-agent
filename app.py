@@ -495,16 +495,19 @@ def _step_creatives() -> None:
                 ),
             )
             text_mode = st.radio(
-                "Testo dentro le immagini?",
+                "Stile immagine",
                 ["auto", "headline", "none"],
                 index=0,
                 horizontal=True,
                 help=(
-                    "**auto** (consigliato): Claude decide se ha senso aggiungere una "
-                    "frase corta nell'immagine in base alla variante.\n\n"
-                    "**headline**: forza il rendering della headline (o di una sua versione "
-                    "punchy 3-5 parole) sull'immagine.\n\n"
-                    "**none**: immagini solo visuali, niente testo renderizzato."
+                    "**auto** (consigliato — ad design ricco): composizione pubblicitaria "
+                    "completa con headline + sub + 2-4 callout (es. '+€3.500/mese', 'ZERO "
+                    "CHIAMATE FREDDE') + CTA bar. Stile split-screen prima/dopo, hero+callouts, "
+                    "o big-text dominante. Multi-elemento, color contrast, icone.\n\n"
+                    "**headline** (foto + scritta): foto pubblicitaria con UN solo titolo "
+                    "in overlay, niente callout o CTA bar. Più sobrio.\n\n"
+                    "**none** (solo foto): immagine puramente visiva, nessun testo "
+                    "renderizzato. Da usare quando il copy nelle ads Meta basta da solo."
                 ),
             )
             image_constraints = st.text_area(

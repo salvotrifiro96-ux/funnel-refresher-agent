@@ -48,39 +48,84 @@ def _section(label: str, body: str) -> str:
     return f"\n{label}:\n{body}\n"
 
 
+_RICH_AD_GUIDANCE = (
+    "Each `image_prompt` must instruct gpt-image-1 to produce a SQUARE 1024x1024 "
+    "ADVERTISING-DESIGN composition — NOT a generic stock photo with a headline "
+    "overlay. Think Meta/Instagram ad, billboard, or magazine spread quality.\n\n"
+    "MANDATORY composition: pick ONE of these structures for each variant and "
+    "describe it in detail:\n"
+    "  A. Split-screen PRIMA / DOPO: vertical divider down the middle, dark+stressed "
+    "     scene LEFT (e.g. before automation), bright+relaxed scene RIGHT (after). "
+    "     Centered glowing icon connects the two halves.\n"
+    "  B. Hero subject + icon-callouts: a real-looking Italian person centered, with "
+    "     3-4 floating callout boxes around them (each with a small icon + 1-3 word "
+    "     Italian label like '+€3.500/MESE' or 'ZERO CHIAMATE FREDDE').\n"
+    "  C. Big-text-dominant: 60% of the frame is bold Italian text (headline + sub), "
+    "     40% is a contextual photo or graphic. Newspaper/billboard style.\n"
+    "  D. Numbers/proof spotlight: a huge number or stat (e.g. '+247 LEAD/MESE') as "
+    "     the visual hero, with supporting photo or icons.\n\n"
+    "MANDATORY visual language for every prompt:\n"
+    "  - HIGH-CONTRAST color palette (e.g. black + electric yellow, navy + orange, "
+    "    deep red + ivory). NO pastels, NO washed-out muted tones.\n"
+    "  - Bold sans-serif uppercase for main headlines (advertising font feel — Inter "
+    "    Black, Anton, Bebas Neue, Helvetica Black).\n"
+    "  - When characters appear: realistic Italian/European 30-50 year olds, NOT "
+    "    plastic stock-photo smile. Authentic micro-expressions.\n"
+    "  - Color-graded: dark/cool for 'before' scenes, warm/golden for 'after'.\n"
+    "  - Iconography: small modern flat-style icons (lightning, checkmark, clock, "
+    "    coin, target) on callouts when relevant.\n"
+    "  - One bold CTA bar at the bottom edge in a contrasting color (e.g. yellow "
+    "    bar with black text, OR red bar with white text) with 2-4 word action "
+    "    verb in Italian.\n\n"
+    "TEXT RENDERING — gpt-image-1 reads quoted Italian text reliably. ALWAYS quote "
+    "exact text inline:\n"
+    '  - Top-bar headline: 3-5 words uppercase bold (e.g. "MENO CAOS. PIÙ TEMPO.")\n'
+    '  - Optional subhead: one short line below (e.g. "AUTOMATIZZA CON L\'AI.")\n'
+    '  - Callouts: 1-3 words each, uppercase\n'
+    '  - Bottom CTA bar: action phrase (e.g. "AUTOMATIZZA. DELEGA. LIBERATI.")\n\n'
+    "Aim for EVERY image_prompt to be 200-400 words long with concrete spatial, "
+    "color, typography, and text-element detail. Vague prompts = bland output."
+)
+
+
 def _copy_system_prompt(image_text_mode: ImageTextMode) -> str:
-    text_clause = {
-        "none": (
-            "The image must be visual-only — DO NOT include any rendered text on the image."
-        ),
-        "headline": (
-            "Render the Italian headline (or a 3-5 word punchy version of it) as text "
-            "on the image. Use a clean, advertising-style font. gpt-image-1 renders text "
-            "reliably — instruct it explicitly with the exact text in quotes."
-        ),
-        "auto": (
-            "You decide whether to include text on the image. If a short Italian phrase "
-            "(<6 words) reinforces the message, include it in the image prompt with exact "
-            "quoted text. Otherwise keep the image visual-only."
-        ),
-    }[image_text_mode]
+    if image_text_mode == "none":
+        text_policy = (
+            "TEXT POLICY: NO rendered text on the image. Image must be purely visual. "
+            "Skip headlines, callouts, CTA bars. Use composition + color + iconography "
+            "only. The Meta ad headline + body will live OUTSIDE the image."
+        )
+    elif image_text_mode == "headline":
+        text_policy = (
+            "TEXT POLICY: render ONLY one dominant Italian headline in the image "
+            "(3-5 words, uppercase bold, top of frame). No subhead, no callouts, "
+            "no CTA bar. Photo-driven with one strong text element overlay."
+        )
+    else:  # "auto" — the default, full ad-design
+        text_policy = (
+            "TEXT POLICY: full advertising design with multiple Italian text elements "
+            "as described in the rich-ad guidance below. Headline + (optional) subhead "
+            "+ 2-4 callout labels + CTA bar. Each text element quoted explicitly."
+        )
+
     return (
-        "You are a senior direct-response copywriter for Italian Meta Ads funnels. "
-        "Your job: take ONE creative angle and produce N distinct ad variants in Italian "
-        "that *attack the same angle from different concrete entry points* (e.g., different "
-        "characters, different micro-pains, different proofs).\n\n"
-        f"Image text policy: {text_clause}\n\n"
-        "Each variant must have:\n"
-        '  - "slug": short snake_case identifier (max 30 chars, ASCII only, no spaces)\n'
-        '  - "headline": ad title shown above the image (max 40 chars, Italian, punchy)\n'
-        '  - "body": the multi-line ad message (Italian, 4–8 short lines separated by \\n, '
-        "      may include emoji at line starts, ends with a one-line CTA)\n"
-        '  - "image_prompt": vivid English prompt for an AI image generator that produces '
-        "      a PHOTOGRAPHIC, advertising-ready square 1024x1024 image embodying the variant. "
-        "      Describe subject, setting, mood, lighting concretely. Avoid generic stock-photo "
-        "      language. Square aspect ratio is mandatory — the prompt must be composable "
-        "      as a square frame.\n\n"
-        "Reply ONLY with a strict JSON array of N variant objects. No prose, no markdown fences."
+        "You are a senior art director and direct-response copywriter for Italian "
+        "Meta Ads funnels. Take ONE creative angle and produce N distinct variants "
+        "that *attack the angle from different concrete entry points* (different "
+        "characters, micro-pains, proofs, formats).\n\n"
+        f"{text_policy}\n\n"
+        f"{_RICH_AD_GUIDANCE}\n\n"
+        "Each variant object MUST have these fields exactly:\n"
+        '  - "slug": short snake_case ASCII identifier (max 30 chars, no spaces)\n'
+        '  - "headline": Meta ad TITLE field (Italian, max 40 chars, punchy). This '
+        "      is the text that appears in Meta\'s ad metadata, NOT necessarily the "
+        "      same as the headline rendered on the image.\n"
+        '  - "body": Meta ad PRIMARY TEXT field (Italian, 4–8 short lines separated '
+        "      by \\n, may use emoji at line starts, ends with a one-line CTA).\n"
+        '  - "image_prompt": detailed advertising-design prompt (200-400 words, '
+        "      English, follows ALL the rich-ad guidance above).\n\n"
+        "Reply ONLY with a strict JSON array of N variant objects. No prose, no "
+        "markdown code fences."
     )
 
 
@@ -124,7 +169,7 @@ def generate_copies(
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4500,
+        max_tokens=8000,  # rich image_prompts run 200-400 words × N variants
         system=_copy_system_prompt(image_text_mode),
         messages=[{"role": "user", "content": user_prompt}],
     )
