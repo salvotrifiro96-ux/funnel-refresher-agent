@@ -1,8 +1,8 @@
-"""Angle generation — Claude proposes 3–5 new creative angles based on diagnosis.
+"""Angle generation — Claude proposes new creative angles based on diagnosis + briefing.
 
-The prompt is structured: it gets the diagnosis snapshot (winners + losers + spent),
-the brand voice and target audience, and is asked to return a strict JSON list of
-angle objects.
+The prompt receives the diagnosis snapshot (winners + losers + spent), the brand
+voice + target audience, plus any briefing context (creative constraints, upcoming
+deadlines, post-diagnosis observations, an optional operator-suggested angle).
 """
 from __future__ import annotations
 
@@ -26,24 +26,23 @@ class Angle:
 
 
 def _build_diagnosis_summary(report: DiagnoseReport) -> str:
-    """Compact, human-readable snapshot the model will reason over."""
     lines: list[str] = [
         f"Window: {report.since} → {report.until} ({report.days} days)",
         f"Total spend: €{report.total_spend:.2f}",
-        f"Total real leads (HubSpot): {report.total_real_leads}",
+        f"Total leads (Meta pixel): {report.total_real_leads}",
     ]
     if report.avg_real_cpl is not None:
-        lines.append(f"Average real CPL: €{report.avg_real_cpl:.2f}")
+        lines.append(f"Average CPL: €{report.avg_real_cpl:.2f}")
     lines.append("")
     lines.append("Per-referral breakdown (sorted by spend):")
     for r in report.referrals[:15]:
         cpl = f"€{r.real_cpl:.2f}" if r.real_cpl is not None else "no leads"
         lines.append(
             f"  - {r.referral}: spend €{r.spend:.2f} | clicks {r.clicks} "
-            f"| HS leads {r.real_leads} | real CPL {cpl}"
+            f"| leads {r.real_leads} | CPL {cpl}"
         )
     lines.append("")
-    lines.append("Pause-candidate ads (real CPL > 1.5x median, or no leads on €30+ spend):")
+    lines.append("Pause-candidate ads (CPL > 1.5x median, or no leads on €30+ spend):")
     pause_rows = [a for a in report.ads if a.recommendation == "pause" and a.status == "ACTIVE"]
     if not pause_rows:
         lines.append("  (none flagged)")
@@ -51,7 +50,7 @@ def _build_diagnosis_summary(report: DiagnoseReport) -> str:
         cpl = f"€{a.real_cpl:.2f}" if a.real_cpl is not None else "no leads"
         lines.append(
             f"  - {a.name} (referral={a.referral}): spend €{a.spend:.2f} "
-            f"| CTR {a.ctr:.2f}% | real CPL {cpl}"
+            f"| CTR {a.ctr:.2f}% | CPL {cpl}"
         )
     return "\n".join(lines)
 
@@ -61,7 +60,7 @@ SYSTEM_PROMPT = (
     "funnels. You analyze fatigue signals (CPL drift, CTR collapse, no-conversion ads) "
     "and propose new creative angles that explore *different psychological levers* than "
     "the ones currently fatigued.\n\n"
-    "Always reply with a strict JSON array of 3 to 5 angle objects, no prose, no markdown "
+    "Always reply with a strict JSON array of angle objects, no prose, no markdown "
     "code fences. Each angle object has these fields:\n"
     '  - "title": short label (max 40 chars), in Italian\n'
     '  - "rationale": why this angle should work given the diagnosis (max 200 chars), in Italian\n'
@@ -71,12 +70,19 @@ SYSTEM_PROMPT = (
 
 
 def _extract_json_array(raw: str) -> list[dict]:
-    """Be lenient: strip ```json fences if the model added them anyway."""
     raw = raw.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
     if fence:
         raw = fence.group(1)
     return json.loads(raw)
+
+
+def _section(label: str, body: str) -> str:
+    """Render an optional briefing section, or empty string if body is blank."""
+    body = (body or "").strip()
+    if not body:
+        return ""
+    return f"\n{label}:\n{body}\n"
 
 
 def propose_angles(
@@ -85,21 +91,44 @@ def propose_angles(
     diagnosis: DiagnoseReport,
     target_audience: str,
     brand_voice: str,
+    n_angles: int = 3,
+    constraints: str = "",
+    deadlines: str = "",
+    extra_notes: str = "",
+    observations: str = "",
+    suggested_angle: str = "",
     extra_instructions: str = "",
 ) -> list[Angle]:
+    """Ask Claude for `n_angles` new angles given diagnosis + briefing context."""
+    if n_angles < 1 or n_angles > 10:
+        raise ValueError(f"n_angles must be in [1, 10], got {n_angles}")
+
     client = Anthropic(api_key=api_key)
-    user_prompt = (
-        f"Target audience: {target_audience}\n"
-        f"Brand voice: {brand_voice}\n"
+    user_prompt_parts = [
+        f"Target audience: {target_audience}",
+        f"Brand voice: {brand_voice}",
+        f"Number of angles to propose: {n_angles}",
+    ]
+    user_prompt_parts.append(_section("Creative constraints (things to AVOID)", constraints))
+    user_prompt_parts.append(_section("Upcoming deadlines / events", deadlines))
+    user_prompt_parts.append(_section("Operator's free notes", extra_notes))
+    user_prompt_parts.append(_section("Operator's observations on the diagnosis numbers", observations))
+    user_prompt_parts.append(
+        _section(
+            "Operator-suggested angle to ALSO include",
+            f"{suggested_angle}\n(Include this as one of the angles, refined and on-brand.)"
+            if suggested_angle.strip()
+            else "",
+        )
     )
-    if extra_instructions.strip():
-        user_prompt += f"Extra notes from operator: {extra_instructions}\n"
-    user_prompt += "\nDiagnosis snapshot:\n" + _build_diagnosis_summary(diagnosis)
-    user_prompt += "\n\nNow return the JSON array of 3 to 5 new creative angles."
+    user_prompt_parts.append(_section("Extra instructions", extra_instructions))
+    user_prompt_parts.append("\nDiagnosis snapshot:\n" + _build_diagnosis_summary(diagnosis))
+    user_prompt_parts.append(f"\n\nNow return the JSON array of exactly {n_angles} new creative angles.")
+    user_prompt = "".join(user_prompt_parts)
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2000,
+        max_tokens=2500,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )

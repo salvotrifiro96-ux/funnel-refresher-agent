@@ -158,6 +158,57 @@ class MetaClient:
             )
         return actives[0]["id"]
 
+    def get_adset_full(self, adset_id: str) -> dict[str, Any]:
+        """Fetch all fields needed to clone an adset (targeting, optimization, etc.)."""
+        fields = [
+            "name",
+            "campaign_id",
+            "daily_budget",
+            "billing_event",
+            "optimization_goal",
+            "bid_strategy",
+            "promoted_object",
+            "targeting",
+            "destination_type",
+            "status",
+            "effective_status",
+        ]
+        return self._get(adset_id, {"fields": ",".join(fields)})
+
+    def create_adset(
+        self,
+        *,
+        campaign_id: str,
+        name: str,
+        daily_budget_cents: int,
+        billing_event: str,
+        optimization_goal: str,
+        bid_strategy: str,
+        promoted_object: dict[str, Any],
+        targeting: dict[str, Any],
+        start_time: str | None = None,
+        status: str = "ACTIVE",
+        destination_type: str | None = None,
+    ) -> str:
+        """Create a new adset. Returns the new adset_id."""
+        data: dict[str, Any] = {
+            "campaign_id": campaign_id,
+            "name": name,
+            "daily_budget": str(daily_budget_cents),
+            "billing_event": billing_event,
+            "optimization_goal": optimization_goal,
+            "bid_strategy": bid_strategy,
+            "promoted_object": json.dumps(promoted_object),
+            "targeting": json.dumps(targeting),
+            "status": status,
+        }
+        if start_time:
+            data["start_time"] = start_time
+        if destination_type:
+            data["destination_type"] = destination_type
+        r = self._post(f"{self.account}/adsets", data)
+        return r["id"]
+
     # ── writes ───────────────────────────────────────────────────────
     def pause_ad(self, ad_id: str) -> None:
         self._post(ad_id, {"status": "PAUSED"})
@@ -188,8 +239,11 @@ class MetaClient:
         body: str,
         cta_type: str = "LEARN_MORE",
         creative_label: str | None = None,
+        status: str = "ACTIVE",
     ) -> dict[str, str]:
-        """Create a creative + ad in ACTIVE state. Returns {'ad_id', 'creative_id'}."""
+        """Create a creative + ad. Returns {'ad_id', 'creative_id'}."""
+        if status not in ("ACTIVE", "PAUSED"):
+            raise ValueError(f"status must be ACTIVE or PAUSED, got {status!r}")
         object_story_spec = {
             "page_id": page_id,
             "instagram_user_id": instagram_user_id,
@@ -215,7 +269,7 @@ class MetaClient:
                 "adset_id": adset_id,
                 "creative": json.dumps({"creative_id": creative["id"]}),
                 "name": ad_name,
-                "status": "ACTIVE",
+                "status": status,
             },
         )
         return {"ad_id": ad["id"], "creative_id": creative["id"]}

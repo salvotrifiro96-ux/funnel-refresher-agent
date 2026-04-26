@@ -1,18 +1,19 @@
 """Funnel Refresher Agent — Streamlit multi-step UI.
 
 Flow:
-  1. Onboarding (sidebar form) → captures Meta creds + campaign details
-  2. Diagnosis  → CPL per referral (Meta pixel), recommendations
-  3. Angles     → Claude proposes 3–5 new angles, operator picks one
-  4. Creatives  → Claude writes copy + gpt-image-1 generates images
-  5. Approval   → operator approves which to pause + which to launch
-  6. Launch     → executes pause + create on Meta
+  0. Onboarding (sidebar)            → Meta creds + campaign details + briefing
+  1. Diagnosis                        → CPL per referral (Meta pixel)
+  2. Angles questionnaire + propose   → Claude proposes new angles
+  3. Creatives questionnaire + gen    → Claude writes copy + gpt-image-1
+  4. Approval (per-variant checkbox)  → operator picks variants
+  5. Pre-launch questionnaire         → status, adset, scheduling, CTA, referral
+  6. Done                             → summary + new ad IDs
 """
 from __future__ import annotations
 
 import os
 import traceback
-from dataclasses import asdict
+from datetime import datetime, timedelta
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -20,7 +21,7 @@ from dotenv import load_dotenv
 from agent.angles import Angle, propose_angles
 from agent.diagnose import DiagnoseReport, run_diagnosis
 from agent.generate import Creative, generate_creatives
-from agent.launch import launch_refresh
+from agent.launch import LaunchPlan, launch_refresh
 from agent.meta_api import MetaClient, MetaError
 
 
@@ -46,7 +47,7 @@ APP_PASSWORD = _secret("APP_PASSWORD")
 st.set_page_config(page_title="Funnel Refresher Agent", layout="wide", page_icon="🎯")
 
 
-# ── Password gate (optional) ───────────────────────────────────────
+# ── Password gate ──────────────────────────────────────────────────
 def _password_gate() -> None:
     if not APP_PASSWORD:
         return
@@ -66,14 +67,17 @@ def _password_gate() -> None:
 _password_gate()
 
 
-# ── State helpers ──────────────────────────────────────────────────
-DEFAULT_STATE = {
+# ── State init ─────────────────────────────────────────────────────
+DEFAULT_STATE: dict[str, object] = {
     "step": "onboarding",
-    "config": None,
+    "config": None,           # credentials + campaign
+    "briefing": None,         # advanced briefing answers
+    "observations": "",       # post-diagnosis observations
     "diagnosis": None,
     "angles": None,
     "chosen_angle_idx": None,
     "creatives": None,
+    "approvals": [],
     "launch_result": None,
     "error": None,
 }
@@ -93,6 +97,11 @@ def _show_error_if_any() -> None:
         st.error(err)
 
 
+def _parse_evergreen_list(raw: str) -> list[str]:
+    """Parse the evergreen-referrals textarea (one per line) into a clean list."""
+    return [line.strip() for line in (raw or "").splitlines() if line.strip()]
+
+
 # ── Sidebar: onboarding form ──────────────────────────────────────
 def _onboarding_sidebar() -> None:
     st.sidebar.header("⚙️ Setup")
@@ -103,6 +112,8 @@ def _onboarding_sidebar() -> None:
         )
 
     cfg = st.session_state.config or {}
+    brief = st.session_state.briefing or {}
+
     with st.sidebar.form("onboarding"):
         meta_account = st.text_input(
             "Meta Ad Account ID",
@@ -143,8 +154,8 @@ def _onboarding_sidebar() -> None:
             placeholder="1615189335210525",
             help=(
                 "📘 Pagina Facebook con cui le ads vengono pubblicate. "
-                "Lo trovi su **facebook.com/yourpage/about** → sezione 'Page transparency' "
-                "o 'About' → 'Page ID'. In alternativa: è già usato dalle ads esistenti "
+                "Lo trovi su **facebook.com/yourpage/about** → 'Page transparency' "
+                "→ 'Page ID'. In alternativa: è già usato dalle ads esistenti "
                 "della campagna che stai rinfrescando — riusa lo stesso."
             ),
         )
@@ -177,9 +188,7 @@ def _onboarding_sidebar() -> None:
             help=(
                 "👥 Descrizione breve del target. Serve a Claude per proporre angoli "
                 "rilevanti. Più sei specifico (età, ruolo, frustrazione tipica), "
-                "più gli angoli proposti saranno mirati. Esempi:\n\n"
-                "• 'Freelance creativi 25-40 sommersi da clienti scocciatori'\n"
-                "• 'Coppie italiane 30-45 che vogliono comprare casa entro 2 anni'"
+                "più gli angoli proposti saranno mirati."
             ),
         )
         brand_voice = st.text_area(
@@ -187,12 +196,7 @@ def _onboarding_sidebar() -> None:
             value=cfg.get("brand_voice", ""),
             placeholder="Diretto, pragmatico, italiano semplice, no anglicismi",
             height=70,
-            help=(
-                "🗣 Tono di voce del brand: questo entra nel prompt di copywriting. "
-                "Esempi:\n\n• 'Diretto, pragmatico, no anglicismi'\n"
-                "• 'Caldo, motivazionale, tu informale, qualche emoji'\n"
-                "• 'Tecnico ma accessibile, dati e numeri concreti'"
-            ),
+            help="🗣 Tono di voce del brand: entra nei prompt di copywriting e angoli.",
         )
         days = st.slider(
             "Lookback days",
@@ -201,15 +205,46 @@ def _onboarding_sidebar() -> None:
             help=(
                 "📅 Quanti giorni indietro la diagnosi guarda per calcolare CTR, CPL "
                 "e identificare la fatigue.\n\n"
-                "• **7 giorni** → molto reattivo ma rumoroso (un weekend storto può "
-                "  far sembrare in fatigue un'ad sana)\n"
-                "• **14 giorni** (default) → bilanciato, cattura il trend recente "
-                "  con segnale stabile\n"
-                "• **30 giorni** → trend più solido, ma include creative pre-fatigue "
-                "  che potrebbero falsare la 'fotografia di adesso'"
+                "• **7** → reattivo ma rumoroso\n"
+                "• **14** (default) → bilanciato\n"
+                "• **30** → trend più solido ma include creative pre-fatigue"
             ),
         )
-        submitted = st.form_submit_button("Save & continue", use_container_width=True)
+
+        with st.expander("📝 Briefing avanzato (opzionale)", expanded=bool(brief)):
+            st.caption("Opzionale ma fortemente consigliato — riduce drasticamente le 'cazzate'.")
+            constraints = st.text_area(
+                "Vincoli creativi — cosa NON fare",
+                value=brief.get("constraints", ""),
+                placeholder="Es. niente facce di donne; no mention competitor; no CTA aggressive; non parlare di prezzi",
+                height=80,
+                help="Viene incluso nei prompt di angoli + copy + immagini.",
+            )
+            deadlines = st.text_area(
+                "Eventi / scadenze imminenti",
+                value=brief.get("deadlines", ""),
+                placeholder="Es. 'iscrizioni chiudono 15 maggio', 'sconto -50% solo questa settimana'",
+                height=70,
+                help="Consente all'agente di iniettare urgenza nelle copy.",
+            )
+            evergreen = st.text_area(
+                "Ads protette — referral o nomi che NON vanno mai pausati (uno per riga)",
+                value=brief.get("evergreen", ""),
+                placeholder="img5\nnew_mktg_ia_2\nimg11_winner",
+                height=70,
+                help=(
+                    "Lista referral o nomi ad da escludere automaticamente dai candidati pause. "
+                    "Match esatto, case-sensitive."
+                ),
+            )
+            free_notes = st.text_area(
+                "Note libere",
+                value=brief.get("free_notes", ""),
+                placeholder="Qualsiasi altro contesto utile (es. 'la landing è stata cambiata 5 giorni fa')",
+                height=70,
+            )
+
+        submitted = st.form_submit_button("💾 Save & continue", use_container_width=True)
 
     if submitted:
         required = {
@@ -237,6 +272,13 @@ def _onboarding_sidebar() -> None:
                 "brand_voice": brand_voice.strip(),
                 "days": days,
             }
+            st.session_state.briefing = {
+                "constraints": constraints.strip(),
+                "deadlines": deadlines.strip(),
+                "evergreen": evergreen.strip(),
+                "evergreen_list": _parse_evergreen_list(evergreen),
+                "free_notes": free_notes.strip(),
+            }
             if st.session_state.step == "onboarding":
                 _set_step("diagnosis")
             st.rerun()
@@ -247,12 +289,14 @@ def _onboarding_sidebar() -> None:
         st.rerun()
 
 
-# ── Step UIs ───────────────────────────────────────────────────────
+# ── Step 0 (welcome) ──────────────────────────────────────────────
 def _step_onboarding() -> None:
     st.title("🎯 Funnel Refresher Agent")
     st.markdown(
         "Compila il **form a sinistra** con le credenziali Meta del cliente "
-        "e i dettagli della campagna da rinfrescare. Poi premi **Save & continue**."
+        "e i dettagli della campagna da rinfrescare. Espandi **Briefing avanzato** "
+        "se hai vincoli, scadenze o ads evergreen — l'agente le rispetterà a ogni step. "
+        "Poi premi **Save & continue**."
     )
     st.info(
         "💡 Le credenziali restano solo nella memoria della sessione (`st.session_state`), "
@@ -260,6 +304,7 @@ def _step_onboarding() -> None:
     )
 
 
+# ── Step 1: Diagnosis ─────────────────────────────────────────────
 def _step_diagnosis() -> None:
     cfg = st.session_state.config
     st.title("Step 1 · Diagnosi")
@@ -326,31 +371,68 @@ def _step_diagnosis() -> None:
         use_container_width=True,
     )
 
+    st.divider()
+    st.subheader("📝 Hai osservazioni sui numeri?")
+    st.caption(
+        "Aiuta l'agente a interpretare correttamente la diagnosi. "
+        "Es. 'la spesa qui è bassa perché era Pasqua e abbiamo bloccato il budget'."
+    )
+    st.session_state.observations = st.text_area(
+        "Osservazioni (opzionale)",
+        value=st.session_state.observations,
+        height=80,
+        label_visibility="collapsed",
+        key="observations_area",
+    )
+
     if st.button("➡️ Propose new angles", type="primary"):
         _set_step("angles")
         st.rerun()
 
 
+# ── Step 2: Angles ────────────────────────────────────────────────
 def _step_angles() -> None:
     st.title("Step 2 · Nuovi angoli")
     cfg = st.session_state.config
+    brief = st.session_state.briefing or {}
     report: DiagnoseReport = st.session_state.diagnosis
 
     if st.session_state.angles is None:
-        extra = st.text_area(
-            "Note aggiuntive (opzionali) — es. 'evita angoli tecnici, parla a chi non sa cos'è un funnel'",
-            value="",
-            height=70,
-        )
-        if st.button("✨ Generate angles", type="primary"):
-            with st.spinner("Claude sta proponendo nuovi angoli…"):
+        with st.form("angles_form"):
+            st.markdown("**Domande prima di proporre gli angoli:**")
+            n_angles = st.slider(
+                "Quanti angoli vuoi che proponga?",
+                min_value=3, max_value=5, value=3,
+                help="3 = focalizzato, scelta veloce. 5 = più variazione, decisione più lunga.",
+            )
+            suggested_angle = st.text_area(
+                "Hai già in mente un angolo specifico da esplorare? (opzionale)",
+                placeholder="Es. 'un angolo basato sulla storia di un caso studio reale di un nostro studente'",
+                height=70,
+                help="Se compilato, l'agente lo include negli angoli proposti, raffinato e on-brand.",
+            )
+            extra_instructions = st.text_area(
+                "Altre indicazioni per l'agente? (opzionale)",
+                placeholder="Es. 'evita angoli puramente tecnici, parla a chi non sa cos'è un funnel'",
+                height=70,
+            )
+            submitted = st.form_submit_button("✨ Generate angles", type="primary")
+
+        if submitted:
+            with st.spinner(f"Claude sta proponendo {n_angles} angoli…"):
                 try:
                     angles = propose_angles(
                         api_key=ANTHROPIC_API_KEY,
                         diagnosis=report,
                         target_audience=cfg["target_audience"],
                         brand_voice=cfg["brand_voice"],
-                        extra_instructions=extra,
+                        n_angles=n_angles,
+                        constraints=brief.get("constraints", ""),
+                        deadlines=brief.get("deadlines", ""),
+                        extra_notes=brief.get("free_notes", ""),
+                        observations=st.session_state.observations,
+                        suggested_angle=suggested_angle,
+                        extra_instructions=extra_instructions,
                     )
                     st.session_state.angles = angles
                     st.rerun()
@@ -359,7 +441,7 @@ def _step_angles() -> None:
         return
 
     angles: list[Angle] = st.session_state.angles
-    st.markdown("Scegli **un angolo**: l'agente genererà 6 varianti creative su quello.")
+    st.markdown(f"**Scegli un angolo** — l'agente genererà N varianti creative su quello.")
     options = [f"{i + 1}. {a.title}" for i, a in enumerate(angles)]
     chosen_label = st.radio("Angoli proposti", options, index=0)
     chosen_idx = options.index(chosen_label)
@@ -378,29 +460,67 @@ def _step_angles() -> None:
     if cols[1].button("🔁 Re-generate"):
         st.session_state.angles = None
         st.rerun()
-    if cols[2].button("➡️ Generate creatives", type="primary"):
+    if cols[2].button("➡️ Configure creatives", type="primary"):
         _set_step("creatives")
         st.rerun()
 
 
+# ── Step 3: Creatives ─────────────────────────────────────────────
 def _step_creatives() -> None:
     st.title("Step 3 · Generazione creative")
     cfg = st.session_state.config
+    brief = st.session_state.briefing or {}
     angles: list[Angle] = st.session_state.angles
     angle = angles[st.session_state.chosen_angle_idx]
 
     if st.session_state.creatives is None:
-        n_variants = st.slider("Quante varianti?", 3, 10, 6)
-        quality = st.selectbox(
-            "Qualità immagine (gpt-image-1)",
-            ["high", "medium", "low"],
-            index=0,
-            help="high ≈ €0.25/img, medium ≈ €0.07/img, low ≈ €0.02/img",
-        )
-        if st.button("🎨 Generate creatives", type="primary"):
+        with st.form("creatives_form"):
+            st.markdown(f"**Angolo scelto**: *{angle.title}* — {angle.promise}")
+            st.markdown("**Domande prima di generare le creative:**")
+
+            cols = st.columns(2)
+            n_variants = cols[0].slider(
+                "Quante varianti?",
+                min_value=3, max_value=10, value=6,
+                help="Più varianti = più scelta in approvazione, ma più costo.",
+            )
+            quality = cols[1].selectbox(
+                "Qualità immagine",
+                ["high", "medium", "low"],
+                index=0,
+                help=(
+                    "**high** ≈ €0.25/img (uso per prod) • "
+                    "**medium** ≈ €0.07/img • "
+                    "**low** ≈ €0.02/img (test rapido)"
+                ),
+            )
+            text_mode = st.radio(
+                "Testo dentro le immagini?",
+                ["auto", "headline", "none"],
+                index=0,
+                horizontal=True,
+                help=(
+                    "**auto** (consigliato): Claude decide se ha senso aggiungere una "
+                    "frase corta nell'immagine in base alla variante.\n\n"
+                    "**headline**: forza il rendering della headline (o di una sua versione "
+                    "punchy 3-5 parole) sull'immagine.\n\n"
+                    "**none**: immagini solo visuali, niente testo renderizzato."
+                ),
+            )
+            image_constraints = st.text_area(
+                "Caratteristiche specifiche delle immagini (opzionale)",
+                placeholder=(
+                    "Es. 'sempre persone reali italiane', 'sfondo ufficio moderno',  "
+                    "'no immagini stock', 'no faccia primo piano'"
+                ),
+                height=70,
+                help="Si aggiunge ai prompt di gpt-image-1 per ogni variante.",
+            )
+            submitted = st.form_submit_button("🎨 Generate creatives", type="primary")
+
+        if submitted:
             with st.spinner(
-                f"Generando {n_variants} copy con Claude e {n_variants} immagini con gpt-image-1… "
-                f"(può richiedere 1-2 min)"
+                f"Generando {n_variants} copy + {n_variants} immagini ({quality})… (1-2 min)"
             ):
                 try:
                     creatives = generate_creatives(
@@ -411,9 +531,12 @@ def _step_creatives() -> None:
                         brand_voice=cfg["brand_voice"],
                         n_variants=n_variants,
                         image_quality=quality,
+                        creative_constraints=brief.get("constraints", ""),
+                        deadlines=brief.get("deadlines", ""),
+                        image_constraints=image_constraints,
+                        image_text_mode=text_mode,
                     )
                     st.session_state.creatives = creatives
-                    # init approvals to all True
                     st.session_state.approvals = [True] * len(creatives)
                     st.rerun()
                 except Exception as e:
@@ -421,7 +544,10 @@ def _step_creatives() -> None:
         return
 
     creatives: list[Creative] = st.session_state.creatives
-    st.markdown(f"Generati **{len(creatives)} variants** sull'angolo *{angle.title}*. Approva quelle che vuoi lanciare.")
+    st.markdown(
+        f"Generati **{len(creatives)} variants** sull'angolo *{angle.title}*. "
+        f"Approva quelle che vuoi lanciare."
+    )
 
     if "approvals" not in st.session_state or len(st.session_state.approvals) != len(creatives):
         st.session_state.approvals = [True] * len(creatives)
@@ -454,7 +580,7 @@ def _step_creatives() -> None:
         st.rerun()
     n_approved = sum(st.session_state.approvals)
     if cols[2].button(
-        f"➡️ Review launch ({n_approved})",
+        f"➡️ Pre-launch ({n_approved})",
         type="primary",
         disabled=n_approved == 0,
     ):
@@ -462,76 +588,284 @@ def _step_creatives() -> None:
         st.rerun()
 
 
+# ── Step 4: Pre-launch questionnaire ──────────────────────────────
 def _step_launch() -> None:
-    st.title("Step 4 · Approvazione finale e lancio")
+    st.title("Step 4 · Pre-launch")
     cfg = st.session_state.config
+    brief = st.session_state.briefing or {}
     report: DiagnoseReport = st.session_state.diagnosis
     creatives: list[Creative] = st.session_state.creatives
     approvals: list[bool] = st.session_state.approvals
-
     approved_creatives = [c for c, ok in zip(creatives, approvals) if ok]
 
-    st.subheader("🛑 Ads da spegnere")
-    pause_options = {
-        a.ad_id: f"{a.name} ({a.referral}) · spend €{a.spend:.2f} · CPL "
-        f"{('€%.2f' % a.real_cpl) if a.real_cpl else '—'}"
-        for a in report.ads
-        if a.status == "ACTIVE"
-    }
+    # Pre-compute defaults from briefing
+    evergreen_list: list[str] = brief.get("evergreen_list", [])
+    active_ads = [a for a in report.ads if a.status == "ACTIVE"]
     pause_default = [
         a.ad_id
-        for a in report.ads
-        if a.status == "ACTIVE" and a.recommendation == "pause"
+        for a in active_ads
+        if a.recommendation == "pause"
+        and a.referral not in evergreen_list
+        and a.name not in evergreen_list
     ]
-    selected_pause = st.multiselect(
-        "Seleziona quali pausare",
-        options=list(pause_options.keys()),
-        default=pause_default,
-        format_func=lambda ad_id: pause_options[ad_id],
-    )
+    untouchable_default = [
+        a.ad_id
+        for a in active_ads
+        if a.referral in evergreen_list or a.name in evergreen_list
+    ]
 
-    st.subheader("🚀 Ads da lanciare")
-    st.markdown(
-        f"**{len(approved_creatives)}** variants approvate. Saranno create nello stesso "
-        f"adset attivo della campagna con tracking `?referral=refresh_N`."
-    )
-    for i, c in enumerate(approved_creatives):
-        st.markdown(f"  {i + 1}. **{c.headline}** · slug `{c.slug}`")
+    pause_options = {
+        a.ad_id: f"{a.name} ({a.referral}) · spend €{a.spend:.2f} · "
+        f"CPL {('€%.2f' % a.real_cpl) if a.real_cpl else '—'}"
+        for a in active_ads
+    }
 
-    st.divider()
-    st.warning(
-        "⚠️ Una volta cliccato **Launch** le Ads vengono create su Meta e i loser pausati. "
-        "Operazione non reversibile da questa UI (puoi sempre rimettere ACTIVE da Meta Ads Manager)."
-    )
+    with st.form("launch_form"):
+        st.subheader("🛑 Ads da pausare")
+        selected_pause = st.multiselect(
+            "Seleziona quali pausare (le 'protette' del briefing sono pre-escluse)",
+            options=list(pause_options.keys()),
+            default=pause_default,
+            format_func=lambda ad_id: pause_options[ad_id],
+        )
 
-    cols = st.columns([1, 1, 3])
-    if cols[0].button("⬅️ Back"):
-        _set_step("creatives")
-        st.rerun()
-    if cols[1].button("🚀 Launch", type="primary", disabled=len(approved_creatives) == 0):
-        with st.spinner("Lancio in corso… (uplodo immagini, creo creatives, creo ads)"):
-            try:
-                meta = MetaClient(cfg["meta_token"], cfg["meta_account"])
-                result = launch_refresh(
-                    meta=meta,
-                    campaign_id=cfg["campaign_id"],
-                    ads_to_pause=selected_pause,
-                    creatives_to_launch=approved_creatives,
-                    landing_url=cfg["landing_url"],
-                    page_id=cfg["page_id"],
-                    instagram_user_id=cfg["ig_user_id"],
+        st.subheader("🛡 Ads protette (non vengono mai pausate)")
+        selected_untouchable = st.multiselect(
+            "Conferma quali NON pausare in nessun caso",
+            options=list(pause_options.keys()),
+            default=untouchable_default,
+            format_func=lambda ad_id: pause_options[ad_id],
+            help=(
+                "Pre-popolato dalla lista 'evergreen' dell'onboarding (match per referral o nome). "
+                "Aggiungi qui altre ads che vuoi blindare."
+            ),
+        )
+
+        st.divider()
+        st.subheader("📦 Dove creare le nuove ads")
+        adset_choice = st.radio(
+            "Scegli l'opzione",
+            options=[
+                "🟢 Stesso adset attivo della campagna · ads ACTIVE subito",
+                "🟡 Stesso adset attivo · ads PAUSED (le attivo io da Ads Manager)",
+                "🔵 Crea nuovo adset dedicato",
+            ],
+            index=0,
+            help=(
+                "**Stesso adset · ACTIVE**: parto subito, nessuna scheduling.\n\n"
+                "**Stesso adset · PAUSED**: ads create ma non attive — utile per QA "
+                "manuale prima di farle partire.\n\n"
+                "**Nuovo adset dedicato**: crea un adset separato (clonando targeting + "
+                "promoted_object), serve se vuoi schedulare la partenza in un orario "
+                "specifico o tenere queste creative fuori dall'algoritmo dell'adset esistente."
+            ),
+        )
+        create_new_adset = adset_choice.startswith("🔵")
+        if adset_choice.startswith("🟢"):
+            start_status = "ACTIVE"
+        elif adset_choice.startswith("🟡"):
+            start_status = "PAUSED"
+        else:
+            start_status = "ACTIVE"  # in new adset, the schedule controls timing
+
+        new_adset_name = ""
+        new_adset_budget = 0.0
+        new_adset_start_iso = ""
+        new_adset_targeting_note = ""
+        if create_new_adset:
+            with st.container(border=True):
+                st.markdown("**Configurazione nuovo adset**")
+                today = datetime.now()
+                default_name = f"Refresh {today.strftime('%Y-%m-%d')}"
+                new_adset_name = st.text_input(
+                    "Nome adset", value=default_name,
+                    help="Visibile in Ads Manager. Default include la data di oggi.",
                 )
-                st.session_state.launch_result = result
-                _set_step("done")
-                st.rerun()
-            except Exception as e:
-                st.session_state.error = f"Launch failed: {e}\n\n{traceback.format_exc()}"
+                new_adset_budget = st.number_input(
+                    "Budget giornaliero (€)",
+                    min_value=5.0,
+                    max_value=10000.0,
+                    value=30.0,
+                    step=5.0,
+                    help="Budget dedicato a questo nuovo adset. Se vuoto, copia dall'adset esistente non è supportato in v1 — devi indicarlo.",
+                )
+                schedule_cols = st.columns(2)
+                schedule_date = schedule_cols[0].date_input(
+                    "Data partenza",
+                    value=today.date(),
+                    min_value=today.date(),
+                    help="Quando il nuovo adset deve iniziare a spendere.",
+                )
+                schedule_time = schedule_cols[1].time_input(
+                    "Ora partenza (Europe/Rome)",
+                    value=(today + timedelta(hours=1)).time().replace(second=0, microsecond=0),
+                    help="Es. 06:00 per partire all'alba.",
+                )
+                # Build ISO 8601 with Italy timezone offset
+                naive = datetime.combine(schedule_date, schedule_time)
+                # Italy is +0100 in winter / +0200 DST. Use +0200 as default for spring/summer.
+                # User will see exact behavior in Ads Manager once created.
+                new_adset_start_iso = naive.strftime("%Y-%m-%dT%H:%M:%S+0200")
+                st.caption(
+                    f"Partenza programmata: `{new_adset_start_iso}` (Europe/Rome). "
+                    f"Se sei in fuso orario diverso, controlla l'orario in Ads Manager dopo la creazione."
+                )
+
+                st.markdown("**Targeting del nuovo adset**")
+                targeting_choice = st.radio(
+                    "Vuoi un targeting specifico?",
+                    options=[
+                        "Copia dall'adset attivo della campagna (consigliato)",
+                        "Voglio un targeting diverso — lo configuro io da Ads Manager dopo la creazione",
+                    ],
+                    index=0,
+                )
+                if targeting_choice.startswith("Voglio un targeting diverso"):
+                    new_adset_targeting_note = st.text_area(
+                        "Memo del targeting che vorrai impostare (solo nota interna)",
+                        placeholder="Es. 'lookalike 1% Italia su ultimi 30gg fb_pixel_lead'",
+                        height=70,
+                    )
+                    st.warning(
+                        "⚠️ Il nuovo adset viene **creato comunque con il targeting clonato**. "
+                        "Vai su Meta Ads Manager subito dopo la creazione per modificarlo. "
+                        "L'agente non lascia il nuovo adset senza targeting per evitare errori API."
+                    )
+
+        st.divider()
+        st.subheader("🏷 Tracking referral")
+        referral_prefix = st.text_input(
+            "Prefisso referral (verrà concatenato con _N)",
+            value="refresh",
+            help=(
+                "Le nuove ads avranno landing URL con `?referral=<prefix>_1`, "
+                "`<prefix>_2`, ecc. — coerente con il tuo schema di tracking esistente."
+            ),
+        )
+        n_to_create = len(approved_creatives)
+        if n_to_create > 0 and referral_prefix.strip():
+            preview = ", ".join(f"{referral_prefix}_{i + 1}" for i in range(min(n_to_create, 4)))
+            if n_to_create > 4:
+                preview += f", … (+{n_to_create - 4})"
+            st.caption(f"Preview: `{preview}`")
+
+        st.subheader("🎯 Call to Action button")
+        cta_type = st.selectbox(
+            "Bottone delle nuove ads",
+            options=[
+                "LEARN_MORE", "SIGN_UP", "APPLY_NOW", "DOWNLOAD",
+                "GET_OFFER", "SUBSCRIBE", "CONTACT_US", "GET_QUOTE",
+            ],
+            index=0,
+            help=(
+                "**LEARN_MORE** → 'Scopri di più' (default lead gen)\n\n"
+                "**SIGN_UP** → 'Iscriviti'\n\n"
+                "**APPLY_NOW** → 'Candidati ora' (ottimo per recruiting/job ads)\n\n"
+                "**DOWNLOAD** → 'Scarica' (lead magnet)\n\n"
+                "**GET_OFFER** → 'Richiedi offerta'\n\n"
+                "**SUBSCRIBE** → 'Iscriviti' (newsletter / corsi)\n\n"
+                "**CONTACT_US** → 'Contattaci'\n\n"
+                "**GET_QUOTE** → 'Richiedi preventivo'"
+            ),
+        )
+
+        submitted = st.form_submit_button("📋 Show launch summary", type="primary", use_container_width=True)
+
+    if submitted:
+        st.session_state["_launch_form_data"] = {
+            "ads_to_pause": tuple(selected_pause),
+            "untouchable_ad_ids": tuple(selected_untouchable),
+            "create_new_adset": create_new_adset,
+            "new_adset_name": new_adset_name,
+            "new_adset_daily_budget_eur": float(new_adset_budget),
+            "new_adset_start_time_iso": new_adset_start_iso if create_new_adset else "",
+            "new_adset_targeting_note": new_adset_targeting_note,
+            "start_status": start_status,
+            "referral_prefix": referral_prefix.strip(),
+            "cta_type": cta_type,
+        }
+
+    form_data = st.session_state.get("_launch_form_data")
+    if form_data:
+        st.divider()
+        st.subheader("📝 Riassunto pre-launch")
+        st.markdown(
+            f"- **Pausa**: {len(form_data['ads_to_pause'])} ads "
+            f"(escluse {len(form_data['untouchable_ad_ids'])} protette)\n"
+            f"- **Crea**: {len(approved_creatives)} nuove ads con prefisso "
+            f"`{form_data['referral_prefix']}` e CTA `{form_data['cta_type']}`\n"
+            f"- **Stato iniziale ads**: `{form_data['start_status']}`\n"
+            f"- **Adset**: "
+            + (
+                f"NUOVO `{form_data['new_adset_name']}` · €{form_data['new_adset_daily_budget_eur']:.0f}/d · "
+                f"start `{form_data['new_adset_start_time_iso']}`"
+                if form_data["create_new_adset"]
+                else "stesso adset attivo della campagna"
+            )
+            + (
+                f"\n- **Memo targeting**: {form_data['new_adset_targeting_note']}"
+                if form_data["create_new_adset"] and form_data["new_adset_targeting_note"]
+                else ""
+            )
+        )
+        st.warning(
+            "⚠️ Una volta cliccato **LAUNCH** le ads vengono create su Meta e i loser pausati. "
+            "Operazione non reversibile da questa UI (puoi sempre rimettere ACTIVE da Ads Manager)."
+        )
+
+        cols = st.columns([1, 1, 3])
+        if cols[0].button("⬅️ Back"):
+            _set_step("creatives")
+            st.session_state["_launch_form_data"] = None
+            st.rerun()
+        if cols[1].button("🚀 LAUNCH", type="primary"):
+            with st.spinner("Lancio in corso… (uplodo immagini, creo creatives, creo ads)"):
+                try:
+                    plan = LaunchPlan(
+                        ads_to_pause=form_data["ads_to_pause"],
+                        untouchable_ad_ids=form_data["untouchable_ad_ids"],
+                        create_new_adset=form_data["create_new_adset"],
+                        new_adset_name=form_data["new_adset_name"],
+                        new_adset_daily_budget_eur=form_data["new_adset_daily_budget_eur"],
+                        new_adset_start_time_iso=form_data["new_adset_start_time_iso"],
+                        new_adset_copy_targeting=True,
+                        new_adset_targeting_note=form_data["new_adset_targeting_note"],
+                        start_status=form_data["start_status"],
+                        referral_prefix=form_data["referral_prefix"],
+                        cta_type=form_data["cta_type"],
+                    )
+                    meta = MetaClient(cfg["meta_token"], cfg["meta_account"])
+                    result = launch_refresh(
+                        meta=meta,
+                        campaign_id=cfg["campaign_id"],
+                        plan=plan,
+                        creatives_to_launch=approved_creatives,
+                        landing_url=cfg["landing_url"],
+                        page_id=cfg["page_id"],
+                        instagram_user_id=cfg["ig_user_id"],
+                    )
+                    st.session_state.launch_result = result
+                    st.session_state["_launch_form_data"] = None
+                    _set_step("done")
+                    st.rerun()
+                except Exception as e:
+                    st.session_state.error = f"Launch failed: {e}\n\n{traceback.format_exc()}"
 
 
+# ── Step 5: Done ──────────────────────────────────────────────────
 def _step_done() -> None:
     st.title("✅ Refresh completato")
     result = st.session_state.launch_result
-    st.success(f"Pausate: {len(result.paused)} · Create: {len(result.created)}")
+    st.success(
+        f"Pausate: {len(result.paused)} · Create: {len(result.created)}"
+        + (f" · Nuovo adset: {result.new_adset_id}" if result.new_adset_id else "")
+    )
+
+    if result.new_adset_id:
+        st.info(
+            f"📦 Nuovo adset creato: `{result.new_adset_id}`. "
+            "Vai su Meta Ads Manager se hai indicato di voler personalizzare il targeting."
+        )
 
     st.subheader("Pausate")
     st.code("\n".join(result.paused) or "(nessuna)")
@@ -540,12 +874,16 @@ def _step_done() -> None:
     st.dataframe(result.created, use_container_width=True)
 
     st.info(
-        "Le ads sono state create in stato ACTIVE. Meta tipicamente impiega 5–30 minuti "
-        "per l'approvazione. Verifica lo status su Ads Manager o rilancia la diagnosi tra qualche ora."
+        "Le ads sono state create. Meta tipicamente impiega 5–30 minuti per l'approvazione. "
+        "Verifica lo status su Ads Manager o rilancia la diagnosi tra qualche ora."
     )
     if st.button("🔄 New refresh (same client)"):
-        for k in ("diagnosis", "angles", "chosen_angle_idx", "creatives", "approvals", "launch_result"):
-            st.session_state[k] = DEFAULT_STATE.get(k)
+        for k in (
+            "diagnosis", "observations", "angles", "chosen_angle_idx",
+            "creatives", "approvals", "launch_result",
+        ):
+            st.session_state[k] = DEFAULT_STATE[k]
+        st.session_state["_launch_form_data"] = None
         _set_step("diagnosis")
         st.rerun()
 
