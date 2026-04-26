@@ -1,8 +1,8 @@
 """Funnel Refresher Agent — Streamlit multi-step UI.
 
 Flow:
-  1. Onboarding (sidebar form) → captures Meta + HubSpot creds + campaign details
-  2. Diagnosis  → real CPL per referral, recommendations
+  1. Onboarding (sidebar form) → captures Meta creds + campaign details
+  2. Diagnosis  → CPL per referral (Meta pixel), recommendations
   3. Angles     → Claude proposes 3–5 new angles, operator picks one
   4. Creatives  → Claude writes copy + gpt-image-1 generates images
   5. Approval   → operator approves which to pause + which to launch
@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 from agent.angles import Angle, propose_angles
 from agent.diagnose import DiagnoseReport, run_diagnosis
 from agent.generate import Creative, generate_creatives
-from agent.hubspot_api import HubSpotClient, HubSpotError
 from agent.launch import launch_refresh
 from agent.meta_api import MetaClient, MetaError
 
@@ -106,60 +105,120 @@ def _onboarding_sidebar() -> None:
     cfg = st.session_state.config or {}
     with st.sidebar.form("onboarding"):
         meta_account = st.text_input(
-            "Meta Ad Account ID", value=cfg.get("meta_account", ""),
+            "Meta Ad Account ID",
+            value=cfg.get("meta_account", ""),
             placeholder="act_191279579779492",
+            help=(
+                "📍 Lo trovi in **Meta Business Manager** → Business Settings → "
+                "Accounts → Ad Accounts. Clicca sull'account: vedi un numero tipo "
+                "`191279579779492`. Anteponi `act_` davanti → `act_191279579779492`."
+            ),
         )
         meta_token = st.text_input(
-            "Meta System User Token", value=cfg.get("meta_token", ""),
+            "Meta System User Token",
+            value=cfg.get("meta_token", ""),
             type="password",
-        )
-        hs_token = st.text_input(
-            "HubSpot Private App Token", value=cfg.get("hs_token", ""),
-            type="password",
+            help=(
+                "🔑 Generalo da **Business Settings** → Users → System Users → "
+                "seleziona o crea un system user → bottone **Generate New Token** → "
+                "scegli l'app, durata **60 giorni** (max), e abilita questi permessi:\n\n"
+                "• `ads_management`\n• `ads_read`\n• `business_management`\n• `pages_read_engagement`\n\n"
+                "⚠️ Scade dopo 60 giorni: rigeneralo periodicamente."
+            ),
         )
         campaign_id = st.text_input(
-            "Meta Campaign ID", value=cfg.get("campaign_id", ""),
+            "Meta Campaign ID",
+            value=cfg.get("campaign_id", ""),
             placeholder="120238282072610614",
+            help=(
+                "🎯 In **Meta Ads Manager**, clicca sulla campagna. L'URL del browser "
+                "contiene `selected_campaign_ids=XXXXXXXXX` — quel numero è l'ID. "
+                "In alternativa: abilita la colonna **Campaign ID** in Ads Manager "
+                "(Customize Columns)."
+            ),
         )
         page_id = st.text_input(
-            "Meta Page ID", value=cfg.get("page_id", ""),
+            "Meta Page ID",
+            value=cfg.get("page_id", ""),
             placeholder="1615189335210525",
+            help=(
+                "📘 Pagina Facebook con cui le ads vengono pubblicate. "
+                "Lo trovi su **facebook.com/yourpage/about** → sezione 'Page transparency' "
+                "o 'About' → 'Page ID'. In alternativa: è già usato dalle ads esistenti "
+                "della campagna che stai rinfrescando — riusa lo stesso."
+            ),
         )
         ig_user_id = st.text_input(
-            "Instagram User ID", value=cfg.get("ig_user_id", ""),
+            "Instagram User ID",
+            value=cfg.get("ig_user_id", ""),
             placeholder="17841401741132064",
+            help=(
+                "📸 ID dell'account Instagram collegato alla pagina. "
+                "Lo trovi in **Business Settings** → Accounts → Instagram Accounts → "
+                "seleziona l'account → l'ID è nei dettagli/URL. Riusa lo stesso ID "
+                "delle ads esistenti per coerenza di brand."
+            ),
         )
         landing_url = st.text_input(
-            "Landing URL", value=cfg.get("landing_url", ""),
+            "Landing URL",
+            value=cfg.get("landing_url", ""),
             placeholder="https://yourbrand.com/your-offer/",
-        )
-        form_id = st.text_input(
-            "HubSpot Form ID", value=cfg.get("form_id", ""),
-            placeholder="2a842b8e-9836-4ab1-84fd-db7e691d0c09",
+            help=(
+                "🌐 URL completo della landing page dove le ads mandano traffico. "
+                "L'agente appende automaticamente `?referral=refresh_N` per il "
+                "tracking — tu metti l'URL pulito, senza parametri."
+            ),
         )
         target_audience = st.text_area(
-            "Target audience (1 sentence)", value=cfg.get("target_audience", ""),
+            "Target audience (1 frase)",
+            value=cfg.get("target_audience", ""),
             placeholder="Imprenditori italiani 35-55 senza background tecnico",
             height=70,
+            help=(
+                "👥 Descrizione breve del target. Serve a Claude per proporre angoli "
+                "rilevanti. Più sei specifico (età, ruolo, frustrazione tipica), "
+                "più gli angoli proposti saranno mirati. Esempi:\n\n"
+                "• 'Freelance creativi 25-40 sommersi da clienti scocciatori'\n"
+                "• 'Coppie italiane 30-45 che vogliono comprare casa entro 2 anni'"
+            ),
         )
         brand_voice = st.text_area(
-            "Brand voice (1 sentence)", value=cfg.get("brand_voice", ""),
-            placeholder="Diretto, pragmatico, parla italiano semplice, no anglicismi",
+            "Brand voice (1 frase)",
+            value=cfg.get("brand_voice", ""),
+            placeholder="Diretto, pragmatico, italiano semplice, no anglicismi",
             height=70,
+            help=(
+                "🗣 Tono di voce del brand: questo entra nel prompt di copywriting. "
+                "Esempi:\n\n• 'Diretto, pragmatico, no anglicismi'\n"
+                "• 'Caldo, motivazionale, tu informale, qualche emoji'\n"
+                "• 'Tecnico ma accessibile, dati e numeri concreti'"
+            ),
         )
-        days = st.slider("Lookback days", 7, 30, value=cfg.get("days", 14))
+        days = st.slider(
+            "Lookback days",
+            7, 30,
+            value=cfg.get("days", 14),
+            help=(
+                "📅 Quanti giorni indietro la diagnosi guarda per calcolare CTR, CPL "
+                "e identificare la fatigue.\n\n"
+                "• **7 giorni** → molto reattivo ma rumoroso (un weekend storto può "
+                "  far sembrare in fatigue un'ad sana)\n"
+                "• **14 giorni** (default) → bilanciato, cattura il trend recente "
+                "  con segnale stabile\n"
+                "• **30 giorni** → trend più solido, ma include creative pre-fatigue "
+                "  che potrebbero falsare la 'fotografia di adesso'"
+            ),
+        )
         submitted = st.form_submit_button("Save & continue", use_container_width=True)
 
     if submitted:
         required = {
             "Meta Account": meta_account,
             "Meta Token": meta_token,
-            "HubSpot Token": hs_token,
             "Campaign ID": campaign_id,
             "Page ID": page_id,
             "IG User ID": ig_user_id,
             "Landing URL": landing_url,
-            "Form ID": form_id,
             "Target audience": target_audience,
             "Brand voice": brand_voice,
         }
@@ -170,12 +229,10 @@ def _onboarding_sidebar() -> None:
             st.session_state.config = {
                 "meta_account": meta_account.strip(),
                 "meta_token": meta_token.strip(),
-                "hs_token": hs_token.strip(),
                 "campaign_id": campaign_id.strip(),
                 "page_id": page_id.strip(),
                 "ig_user_id": ig_user_id.strip(),
                 "landing_url": landing_url.strip(),
-                "form_id": form_id.strip(),
                 "target_audience": target_audience.strip(),
                 "brand_voice": brand_voice.strip(),
                 "days": days,
@@ -194,7 +251,7 @@ def _onboarding_sidebar() -> None:
 def _step_onboarding() -> None:
     st.title("🎯 Funnel Refresher Agent")
     st.markdown(
-        "Compila il **form a sinistra** con le credenziali Meta + HubSpot del cliente "
+        "Compila il **form a sinistra** con le credenziali Meta del cliente "
         "e i dettagli della campagna da rinfrescare. Poi premi **Save & continue**."
     )
     st.info(
@@ -213,20 +270,17 @@ def _step_diagnosis() -> None:
 
     if st.session_state.diagnosis is None:
         if st.button("🔍 Run diagnosis", type="primary"):
-            with st.spinner("Pulling Meta ads, insights e HubSpot submissions…"):
+            with st.spinner("Pulling Meta ads + insights…"):
                 try:
                     meta = MetaClient(cfg["meta_token"], cfg["meta_account"])
-                    hs = HubSpotClient(cfg["hs_token"])
                     report = run_diagnosis(
                         meta=meta,
-                        hubspot=hs,
                         campaign_id=cfg["campaign_id"],
-                        form_id=cfg["form_id"],
                         days=cfg["days"],
                     )
                     st.session_state.diagnosis = report
                     st.rerun()
-                except (MetaError, HubSpotError, ValueError) as e:
+                except (MetaError, ValueError) as e:
                     st.session_state.error = f"Diagnosis failed: {e}"
                 except Exception as e:
                     st.session_state.error = f"Unexpected error: {e}\n\n{traceback.format_exc()}"
@@ -235,7 +289,7 @@ def _step_diagnosis() -> None:
     report: DiagnoseReport = st.session_state.diagnosis
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Spesa", f"€{report.total_spend:,.2f}")
-    c2.metric("Lead reali (HubSpot)", report.total_real_leads)
+    c2.metric("Lead (Meta pixel)", report.total_real_leads)
     c3.metric("CPL medio", f"€{report.avg_real_cpl:,.2f}" if report.avg_real_cpl else "—")
     c4.metric("Da spegnere (suggerito)", len(report.candidate_ads_to_pause))
 
@@ -246,8 +300,8 @@ def _step_diagnosis() -> None:
                 "referral": r.referral,
                 "spend €": round(r.spend, 2),
                 "clicks": r.clicks,
-                "lead HS": r.real_leads,
-                "CPL reale €": round(r.real_cpl, 2) if r.real_cpl is not None else None,
+                "lead": r.real_leads,
+                "CPL €": round(r.real_cpl, 2) if r.real_cpl is not None else None,
             }
             for r in report.referrals
         ],
@@ -263,7 +317,7 @@ def _step_diagnosis() -> None:
                 "referral": a.referral,
                 "spend €": round(a.spend, 2),
                 "ctr %": round(a.ctr, 2),
-                "lead HS": a.real_leads,
+                "lead": a.real_leads,
                 "CPL €": round(a.real_cpl, 2) if a.real_cpl is not None else None,
                 "reco": a.recommendation,
             }

@@ -5,8 +5,8 @@ Streamlit web app that runs a creative refresh on a Meta Ads funnel.
 Workflow (one campaign at a time, on-demand):
 
 1. **Onboarding** — client fills form with Meta + HubSpot tokens and campaign details.
-2. **Diagnosis** — pulls last 14 days of ad-level performance from Meta and cross-references
-   with HubSpot Form Submissions to compute *real* CPL per `?referral=` parameter.
+2. **Diagnosis** — pulls last 14 days of ad-level performance from Meta and aggregates
+   per `?referral=` parameter. Lead source: Meta pixel (`fb_pixel_lead`).
 3. **Angle proposal** — Claude proposes 3–5 new creative angles based on what is fatigued
    and the brand voice / target audience.
 4. **Creative generation** — Claude writes copy/headlines, `gpt-image-1` produces the visuals.
@@ -41,10 +41,8 @@ The client (the funnel owner) provides their own credentials in the onboarding f
 
 - **Meta Ad Account ID** — `act_XXXXXXXXX`
 - **Meta System User Access Token** — generated from Business Settings → System Users
-- **HubSpot Private App Token**
 - **Meta Campaign ID** — the campaign to refresh
 - **Landing URL** — destination for new ads (referral param appended automatically)
-- **HubSpot Form ID** — the lead-capture form on that landing
 - **Page ID + Instagram User ID** — required to create ads on the right Page/IG account
 - **Target audience** (1 sentence) — drives angle generation
 - **Brand voice** (1 sentence) — drives copy generation

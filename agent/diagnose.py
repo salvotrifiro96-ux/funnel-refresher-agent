@@ -1,7 +1,10 @@
-"""Diagnosis step — cross-reference Meta spend with HubSpot real leads.
+"""Diagnosis step — pulls Meta ad-level performance and groups by `referral`.
 
 Produces a `DiagnoseReport` that the UI renders as tables and that we hand to the
 angle-generation prompt as ground truth ("here is what is fatigued and why").
+
+Lead source: Meta pixel (`offsite_conversion.fb_pixel_lead`, `lead`, `onsite_web_lead`).
+HubSpot integration was scoped out of v1 — Meta's reported leads are the data source.
 """
 from __future__ import annotations
 
@@ -9,7 +12,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from agent.hubspot_api import HubSpotClient
 from agent.meta_api import AdInfo, AdInsights, MetaClient
 
 
@@ -85,46 +87,37 @@ def _classify(
 def run_diagnosis(
     *,
     meta: MetaClient,
-    hubspot: HubSpotClient,
     campaign_id: str,
-    form_id: str,
     days: int = 14,
 ) -> DiagnoseReport:
-    """Full diagnosis: ads + insights + HubSpot submissions joined on `referral`."""
+    """Full diagnosis: ads + insights aggregated per `referral`. Leads from Meta pixel."""
     until_dt = datetime.now()
     since_dt = until_dt - timedelta(days=days)
     since = since_dt.strftime("%Y-%m-%d")
     until = until_dt.strftime("%Y-%m-%d")
-    since_ms = int(since_dt.timestamp() * 1000)
-    until_ms = int((until_dt + timedelta(days=1)).timestamp() * 1000)
 
-    # 1. Meta — ads + insights
+    # 1. Meta — ads + insights (insights includes pixel-reported leads)
     ads: list[AdInfo] = meta.list_ads(campaign_id)
     insights_by_id: dict[str, AdInsights] = {
         ad.ad_id: meta.get_insights(ad.ad_id, since, until) for ad in ads
     }
 
-    # 2. HubSpot — real leads grouped by referral
-    submissions = hubspot.get_form_submissions(form_id, since_ms, until_ms)
-    leads_by_referral: dict[str, int] = defaultdict(int)
-    for s in submissions:
-        leads_by_referral[s.referral] += 1
-
-    # 3. Aggregate per-referral spend (sum across ads sharing the same referral)
-    spend_by_referral: dict[str, dict[str, float]] = defaultdict(
-        lambda: {"spend": 0.0, "clicks": 0}
+    # 2. Aggregate per-referral: spend, clicks, and leads (sum across ads sharing the
+    #    same referral). Meta pixel leads are the lead-source-of-truth in v1.
+    agg_by_referral: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"spend": 0.0, "clicks": 0, "leads": 0}
     )
     for ad in ads:
         ins = insights_by_id[ad.ad_id]
-        spend_by_referral[ad.referral]["spend"] += ins.spend
-        spend_by_referral[ad.referral]["clicks"] += ins.clicks
+        agg_by_referral[ad.referral]["spend"] += ins.spend
+        agg_by_referral[ad.referral]["clicks"] += ins.clicks
+        agg_by_referral[ad.referral]["leads"] += ins.meta_leads
 
     referral_rows: list[ReferralRow] = []
-    all_refs = set(spend_by_referral) | set(leads_by_referral)
-    for ref in all_refs:
-        spend = spend_by_referral[ref]["spend"]
-        clicks = int(spend_by_referral[ref]["clicks"])
-        leads = leads_by_referral.get(ref, 0)
+    for ref, agg in agg_by_referral.items():
+        spend = agg["spend"]
+        clicks = int(agg["clicks"])
+        leads = int(agg["leads"])
         cpl = (spend / leads) if leads > 0 else None
         referral_rows.append(ReferralRow(ref, spend, clicks, leads, cpl))
     referral_rows.sort(key=lambda r: r.spend, reverse=True)
