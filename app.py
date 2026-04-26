@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from agent.angles import Angle, propose_angles
 from agent.diagnose import DiagnoseReport, run_diagnosis
-from agent.generate import Creative, generate_creatives
+from agent.generate import Creative, generate_creatives, regenerate_one_variant
 from agent.launch import LaunchPlan, launch_refresh
 from agent.meta_api import MetaClient, MetaError
 
@@ -70,14 +70,15 @@ _password_gate()
 # ── State init ─────────────────────────────────────────────────────
 DEFAULT_STATE: dict[str, object] = {
     "step": "onboarding",
-    "config": None,           # credentials + campaign
-    "briefing": None,         # advanced briefing answers
-    "observations": "",       # post-diagnosis observations
+    "config": None,             # credentials + campaign
+    "briefing": None,           # advanced briefing answers
+    "observations": "",         # post-diagnosis observations
     "diagnosis": None,
     "angles": None,
     "chosen_angle_idx": None,
     "creatives": None,
     "approvals": [],
+    "creative_settings": None,  # n_variants, quality, text_mode, constraints (for regen)
     "launch_result": None,
     "error": None,
 }
@@ -541,6 +542,11 @@ def _step_creatives() -> None:
                     )
                     st.session_state.creatives = creatives
                     st.session_state.approvals = [True] * len(creatives)
+                    st.session_state.creative_settings = {
+                        "image_quality": quality,
+                        "image_text_mode": text_mode,
+                        "image_constraints": image_constraints,
+                    }
                     st.rerun()
                 except Exception as e:
                     st.session_state.error = f"Creative generation failed: {e}"
@@ -555,6 +561,7 @@ def _step_creatives() -> None:
     if "approvals" not in st.session_state or len(st.session_state.approvals) != len(creatives):
         st.session_state.approvals = [True] * len(creatives)
 
+    settings = st.session_state.creative_settings or {}
     for i, c in enumerate(creatives):
         with st.container(border=True):
             cols = st.columns([1, 2])
@@ -567,11 +574,60 @@ def _step_creatives() -> None:
                 st.caption(f"slug: `{c.slug}`")
                 with st.expander("Image prompt"):
                     st.text(c.image_prompt)
-            st.session_state.approvals[i] = st.checkbox(
+
+            approved = st.checkbox(
                 f"✅ Approva variante {i + 1}",
                 value=st.session_state.approvals[i],
                 key=f"approve_{i}",
             )
+            st.session_state.approvals[i] = approved
+
+            if not approved:
+                feedback = st.text_area(
+                    "💬 Cosa vuoi modificare? (poi clicca Rigenera, oppure scartala)",
+                    placeholder=(
+                        "Es. 'metti più colore vivo', 'sostituisci la donna con un uomo', "
+                        "'elimina la CTA bar in basso', 'rendi la headline più aggressiva', "
+                        "'riduci il testo nell'immagine'"
+                    ),
+                    key=f"feedback_{i}",
+                    height=80,
+                )
+                action_cols = st.columns([1, 1, 3])
+                if action_cols[0].button(
+                    "🔄 Rigenera con feedback",
+                    key=f"regen_{i}",
+                    type="primary",
+                    disabled=not feedback.strip(),
+                ):
+                    with st.spinner("Rigenerazione in corso (~30 sec)…"):
+                        try:
+                            new_creative = regenerate_one_variant(
+                                anthropic_api_key=ANTHROPIC_API_KEY,
+                                openai_api_key=OPENAI_API_KEY,
+                                angle=angle,
+                                original=c,
+                                feedback=feedback,
+                                target_audience=cfg["target_audience"],
+                                brand_voice=cfg["brand_voice"],
+                                creative_constraints=brief.get("constraints", ""),
+                                deadlines=brief.get("deadlines", ""),
+                                image_constraints=settings.get("image_constraints", ""),
+                                image_text_mode=settings.get("image_text_mode", "auto"),
+                                image_quality=settings.get("image_quality", "high"),
+                            )
+                            st.session_state.creatives[i] = new_creative
+                            st.session_state.approvals[i] = True
+                            st.session_state[f"feedback_{i}"] = ""
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Regen failed: {e}")
+                if action_cols[1].button("🗑 Scarta variante", key=f"discard_{i}"):
+                    del st.session_state.creatives[i]
+                    del st.session_state.approvals[i]
+                    st.session_state.pop(f"feedback_{i}", None)
+                    st.session_state.pop(f"approve_{i}", None)
+                    st.rerun()
 
     cols = st.columns([1, 1, 1, 3])
     if cols[0].button("⬅️ Angles"):

@@ -177,6 +177,99 @@ def generate_copies(
     return _extract_json_array(text)
 
 
+REGEN_SYSTEM_PROMPT = (
+    "You are revising ONE existing Italian Meta ad creative variant based on operator "
+    "feedback. Read the original variant + the feedback, then produce a SINGLE revised "
+    "variant that addresses the feedback while staying on-brand, on-angle, and on-target. "
+    "If the feedback is purely about the image (e.g. 'più colore', 'metti un uomo'), keep "
+    "headline+body roughly the same and only revise image_prompt. If feedback is about "
+    "the copy (e.g. 'headline più aggressiva'), revise headline/body and keep image_prompt "
+    "close to original. If both, revise both. Always keep the same slug to make tracking easy.\n\n"
+    "Reply with ONE JSON object (NOT an array), no prose, no markdown fences. Fields: "
+    '"slug", "headline", "body", "image_prompt". Same content rules as a fresh generation '
+    "(rich ad-design composition for image_prompt, etc.)."
+)
+
+
+def regenerate_one_variant(
+    *,
+    anthropic_api_key: str,
+    openai_api_key: str,
+    angle: Angle,
+    original: Creative,
+    feedback: str,
+    target_audience: str,
+    brand_voice: str,
+    creative_constraints: str = "",
+    deadlines: str = "",
+    image_constraints: str = "",
+    image_text_mode: ImageTextMode = "auto",
+    image_quality: str = "high",
+) -> Creative:
+    """Regenerate a SINGLE variant given operator feedback. Returns the revised Creative."""
+    if not feedback.strip():
+        raise ValueError("Feedback cannot be empty for regeneration")
+
+    client = Anthropic(api_key=anthropic_api_key)
+    user_prompt_parts = [
+        f"Target audience: {target_audience}",
+        f"Brand voice: {brand_voice}",
+        "",
+        "Chosen angle:",
+        f"  Title: {angle.title}",
+        f"  Rationale: {angle.rationale}",
+        f"  Target pain: {angle.target_pain}",
+        f"  Promise: {angle.promise}",
+        "",
+        "ORIGINAL variant to revise:",
+        f"  slug: {original.slug}",
+        f"  headline: {original.headline}",
+        f"  body: |",
+    ]
+    for line in original.body.splitlines():
+        user_prompt_parts.append(f"    {line}")
+    user_prompt_parts.append(f"  image_prompt: {original.image_prompt}")
+    user_prompt_parts.append("")
+    user_prompt_parts.append("OPERATOR FEEDBACK (the modification to apply):")
+    user_prompt_parts.append(f"  {feedback}")
+    user_prompt_parts.append(_section("Copy constraints (still apply)", creative_constraints))
+    user_prompt_parts.append(_section("Deadlines / urgency (still apply)", deadlines))
+    user_prompt_parts.append(_section("Image constraints (still apply)", image_constraints))
+    user_prompt_parts.append("\nReturn the revised variant as ONE JSON object now.")
+    user_prompt = "\n".join(user_prompt_parts)
+
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2500,
+        system=REGEN_SYSTEM_PROMPT + "\n\n" + _RICH_AD_GUIDANCE,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    raw = text.strip()
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", raw, re.DOTALL)
+    if fence:
+        raw = fence.group(1)
+    revised = json.loads(raw)
+    if isinstance(revised, list):
+        # Be lenient if Claude returned an array of one
+        revised = revised[0]
+
+    slug = re.sub(r"[^a-z0-9_]+", "_", str(revised["slug"]).lower()).strip("_")[:30] or original.slug
+    image_bytes = generate_image(
+        api_key=openai_api_key,
+        prompt=str(revised["image_prompt"]),
+        quality=image_quality,
+        size=IMAGE_SIZE_SQUARE,
+    )
+    return Creative(
+        slug=slug,
+        headline=str(revised["headline"]).strip(),
+        body=str(revised["body"]).strip(),
+        image_prompt=str(revised["image_prompt"]).strip(),
+        image_bytes=image_bytes,
+    )
+
+
 def generate_image(
     *,
     api_key: str,
