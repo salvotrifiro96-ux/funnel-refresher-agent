@@ -63,8 +63,11 @@ def _classify(
     # Not enough data — leave it alone
     if spend < 10:
         return "watch"
+    # No leads yet but spend hasn't crossed the eval threshold → keep watching
+    if real_cpl is None and spend < 30:
+        return "watch"
     # No leads despite meaningful spend → pause
-    if (real_cpl is None) and spend >= 30:
+    if real_cpl is None and spend >= 30:
         return "pause"
     # CPL is meaningfully worse than the median (>1.5x) → pause candidate
     if (
