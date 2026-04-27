@@ -23,6 +23,7 @@ from agent.diagnose import DiagnoseReport, apply_lead_overrides, run_diagnosis
 from agent.generate import Creative, generate_creatives, regenerate_one_variant
 from agent.launch import LaunchPlan, launch_refresh
 from agent.meta_api import MetaClient, MetaError
+from agent.usage_log import ensure_schema as _ensure_usage_schema, log_event as _log_event
 
 
 # ── Config ─────────────────────────────────────────────────────────
@@ -46,6 +47,11 @@ APP_PASSWORD = _secret("APP_PASSWORD")
 
 st.set_page_config(page_title="Funnel Refresher Agent", layout="wide", page_icon="🎯")
 
+# Ensure the usage log table exists once per process. No-op if DB not configured.
+if not st.session_state.get("_usage_schema_ready"):
+    _ensure_usage_schema()
+    st.session_state["_usage_schema_ready"] = True
+
 
 # ── Password gate ──────────────────────────────────────────────────
 def _password_gate() -> None:
@@ -58,8 +64,10 @@ def _password_gate() -> None:
     if st.button("Enter"):
         if pw == APP_PASSWORD:
             st.session_state.authed = True
+            _log_event("login_success")
             st.rerun()
         else:
+            _log_event("login_failed")
             st.error("Wrong password")
     st.stop()
 
@@ -290,6 +298,22 @@ def _onboarding_sidebar() -> None:
                 "evergreen_list": _parse_evergreen_list(evergreen),
                 "free_notes": free_notes.strip(),
             }
+            _log_event(
+                "onboarding_saved",
+                meta_account=meta_account.strip(),
+                campaign_id=campaign_id.strip(),
+                landing_url=landing_url.strip(),
+                payload={
+                    "page_id": page_id.strip(),
+                    "ig_user_id": ig_user_id.strip(),
+                    "target_audience": target_audience.strip()[:300],
+                    "brand_voice": brand_voice.strip()[:200],
+                    "days": days,
+                    "has_constraints": bool(constraints.strip()),
+                    "has_deadlines": bool(deadlines.strip()),
+                    "evergreen_count": len(_parse_evergreen_list(evergreen)),
+                },
+            )
             if st.session_state.step == "onboarding":
                 _set_step("diagnosis")
             st.rerun()
@@ -335,6 +359,20 @@ def _step_diagnosis() -> None:
                         days=cfg["days"],
                     )
                     st.session_state.diagnosis = report
+                    _log_event(
+                        "diagnosis_run",
+                        meta_account=cfg["meta_account"],
+                        campaign_id=cfg["campaign_id"],
+                        landing_url=cfg.get("landing_url"),
+                        payload={
+                            "days": cfg["days"],
+                            "total_spend": float(report.total_spend),
+                            "total_real_leads": int(report.total_real_leads),
+                            "avg_real_cpl": float(report.avg_real_cpl) if report.avg_real_cpl else None,
+                            "candidate_pause_count": len(report.candidate_ads_to_pause),
+                            "ads_count": len(report.ads),
+                        },
+                    )
                     st.rerun()
                 except (MetaError, ValueError) as e:
                     st.session_state.error = f"Diagnosis failed: {e}"
@@ -492,6 +530,19 @@ def _step_angles() -> None:
                         extra_instructions=extra_instructions,
                     )
                     st.session_state.angles = angles
+                    _log_event(
+                        "angles_generated",
+                        meta_account=cfg["meta_account"],
+                        campaign_id=cfg["campaign_id"],
+                        landing_url=cfg.get("landing_url"),
+                        payload={
+                            "n_angles": n_angles,
+                            "titles": [a.title for a in angles],
+                            "had_suggested_angle": bool(suggested_angle.strip()),
+                            "had_extra_instructions": bool(extra_instructions.strip()),
+                            "had_observations": bool(st.session_state.observations.strip()),
+                        },
+                    )
                     st.rerun()
                 except Exception as e:
                     st.session_state.error = f"Angle generation failed: {e}"
@@ -603,6 +654,19 @@ def _step_creatives() -> None:
                         "image_text_mode": text_mode,
                         "image_constraints": image_constraints,
                     }
+                    _log_event(
+                        "creatives_generated",
+                        meta_account=cfg["meta_account"],
+                        campaign_id=cfg["campaign_id"],
+                        landing_url=cfg.get("landing_url"),
+                        payload={
+                            "angle_title": angle.title,
+                            "n_variants": n_variants,
+                            "image_quality": quality,
+                            "image_text_mode": text_mode,
+                            "had_image_constraints": bool(image_constraints.strip()),
+                        },
+                    )
                     st.rerun()
                 except Exception as e:
                     st.session_state.error = f"Creative generation failed: {e}"
@@ -975,9 +1039,32 @@ def _step_launch() -> None:
                     )
                     st.session_state.launch_result = result
                     st.session_state["_launch_form_data"] = None
+                    _log_event(
+                        "launch_executed",
+                        meta_account=cfg["meta_account"],
+                        campaign_id=cfg["campaign_id"],
+                        landing_url=cfg.get("landing_url"),
+                        payload={
+                            "paused_count": len(result.paused),
+                            "created_count": len(result.created),
+                            "new_adset_id": result.new_adset_id,
+                            "create_new_adset": form_data["create_new_adset"],
+                            "start_status": form_data["start_status"],
+                            "cta_type": form_data["cta_type"],
+                            "referral_prefix": form_data["referral_prefix"],
+                            "approved_creatives": len(approved_creatives),
+                        },
+                    )
                     _set_step("done")
                     st.rerun()
                 except Exception as e:
+                    _log_event(
+                        "launch_failed",
+                        meta_account=cfg["meta_account"],
+                        campaign_id=cfg["campaign_id"],
+                        landing_url=cfg.get("landing_url"),
+                        payload={"error": str(e)[:500]},
+                    )
                     st.session_state.error = f"Launch failed: {e}\n\n{traceback.format_exc()}"
 
 
