@@ -19,7 +19,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from agent.angles import Angle, propose_angles
-from agent.diagnose import DiagnoseReport, run_diagnosis
+from agent.diagnose import DiagnoseReport, apply_lead_overrides, run_diagnosis
 from agent.generate import Creative, generate_creatives, regenerate_one_variant
 from agent.launch import LaunchPlan, launch_refresh
 from agent.meta_api import MetaClient, MetaError
@@ -73,7 +73,8 @@ DEFAULT_STATE: dict[str, object] = {
     "config": None,             # credentials + campaign
     "briefing": None,           # advanced briefing answers
     "observations": "",         # post-diagnosis observations
-    "diagnosis": None,
+    "diagnosis": None,          # raw, from Meta API
+    "lead_overrides": {},       # {referral: int} — manual lead corrections
     "angles": None,
     "chosen_angle_idx": None,
     "creatives": None,
@@ -101,6 +102,15 @@ def _show_error_if_any() -> None:
 def _parse_evergreen_list(raw: str) -> list[str]:
     """Parse the evergreen-referrals textarea (one per line) into a clean list."""
     return [line.strip() for line in (raw or "").splitlines() if line.strip()]
+
+
+def _corrected_diagnosis() -> DiagnoseReport | None:
+    """Return the diagnosis report with manual lead overrides applied (if any)."""
+    raw = st.session_state.get("diagnosis")
+    if raw is None:
+        return None
+    overrides = st.session_state.get("lead_overrides") or {}
+    return apply_lead_overrides(raw, overrides)
 
 
 # ── Sidebar: onboarding form ──────────────────────────────────────
@@ -332,29 +342,75 @@ def _step_diagnosis() -> None:
                     st.session_state.error = f"Unexpected error: {e}\n\n{traceback.format_exc()}"
         return
 
-    report: DiagnoseReport = st.session_state.diagnosis
+    raw_report: DiagnoseReport = st.session_state.diagnosis
+    # Build a quick lookup of Meta-reported leads (the "ground truth" before overrides)
+    meta_leads_by_referral = {r.referral: r.real_leads for r in raw_report.referrals}
+
+    # Apply any existing overrides to get the corrected report for display + downstream
+    report = _corrected_diagnosis() or raw_report
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Spesa", f"€{report.total_spend:,.2f}")
-    c2.metric("Lead (Meta pixel)", report.total_real_leads)
+    c2.metric("Lead totali", report.total_real_leads)
     c3.metric("CPL medio", f"€{report.avg_real_cpl:,.2f}" if report.avg_real_cpl else "—")
     c4.metric("Da spegnere (suggerito)", len(report.candidate_ads_to_pause))
 
     st.subheader("📈 Per referral")
-    st.dataframe(
-        [
-            {
-                "referral": r.referral,
-                "spend €": round(r.spend, 2),
-                "clicks": r.clicks,
-                "lead": r.real_leads,
-                "CPL €": round(r.real_cpl, 2) if r.real_cpl is not None else None,
-            }
-            for r in report.referrals
-        ],
-        use_container_width=True,
+    st.caption(
+        "💡 La colonna **lead corretto** è editabile: se i lead Meta non corrispondono a "
+        "quelli reali (es. li conti su HubSpot/CRM), correggili qui — CPL e raccomandazione "
+        '"da spegnere" si ricalcolano automaticamente.'
     )
 
+    edit_data = [
+        {
+            "referral": r.referral,
+            "spend €": round(r.spend, 2),
+            "clicks": r.clicks,
+            "lead Meta": meta_leads_by_referral.get(r.referral, 0),
+            "lead corretto": r.real_leads,
+            "CPL €": round(r.real_cpl, 2) if r.real_cpl is not None else None,
+        }
+        for r in report.referrals
+    ]
+    edited = st.data_editor(
+        edit_data,
+        disabled=["referral", "spend €", "clicks", "lead Meta", "CPL €"],
+        column_config={
+            "lead corretto": st.column_config.NumberColumn(
+                "lead corretto",
+                min_value=0,
+                step=1,
+                format="%d",
+                help="Edita questo numero se i lead reali sono diversi da quelli del pixel Meta.",
+            ),
+            "CPL €": st.column_config.NumberColumn(format="%.2f"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        key="leads_editor",
+    )
+
+    # Sync edits back to lead_overrides state
+    new_overrides: dict[str, int] = {}
+    for row in edited:
+        ref = row["referral"]
+        corrected = int(row["lead corretto"]) if row["lead corretto"] is not None else 0
+        meta_val = meta_leads_by_referral.get(ref, 0)
+        if corrected != meta_val:
+            new_overrides[ref] = corrected
+    if new_overrides != (st.session_state.lead_overrides or {}):
+        st.session_state.lead_overrides = new_overrides
+        st.rerun()
+
+    if st.session_state.lead_overrides:
+        st.success(
+            f"✏️ {len(st.session_state.lead_overrides)} referral con lead corretti manualmente. "
+            "CPL, raccomandazioni e step successivi useranno i valori corretti."
+        )
+
     st.subheader("📋 Per ad")
+    st.caption("Read-only — i lead riflettono i correzioni della tabella sopra.")
     st.dataframe(
         [
             {
@@ -396,7 +452,7 @@ def _step_angles() -> None:
     st.title("Step 2 · Nuovi angoli")
     cfg = st.session_state.config
     brief = st.session_state.briefing or {}
-    report: DiagnoseReport = st.session_state.diagnosis
+    report: DiagnoseReport = _corrected_diagnosis()  # uses lead overrides if any
 
     if st.session_state.angles is None:
         with st.form("angles_form"):
@@ -652,7 +708,7 @@ def _step_launch() -> None:
     st.title("Step 4 · Pre-launch")
     cfg = st.session_state.config
     brief = st.session_state.briefing or {}
-    report: DiagnoseReport = st.session_state.diagnosis
+    report: DiagnoseReport = _corrected_diagnosis()  # uses lead overrides if any
     creatives: list[Creative] = st.session_state.creatives
     approvals: list[bool] = st.session_state.approvals
     approved_creatives = [c for c, ok in zip(creatives, approvals) if ok]
@@ -938,7 +994,7 @@ def _step_done() -> None:
     )
     if st.button("🔄 New refresh (same client)"):
         for k in (
-            "diagnosis", "observations", "angles", "chosen_angle_idx",
+            "diagnosis", "lead_overrides", "observations", "angles", "chosen_angle_idx",
             "creatives", "approvals", "launch_result",
         ):
             st.session_state[k] = DEFAULT_STATE[k]

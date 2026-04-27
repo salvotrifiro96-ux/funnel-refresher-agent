@@ -185,3 +185,94 @@ def run_diagnosis(
         avg_real_cpl=avg_cpl,
         candidate_ads_to_pause=candidates,
     )
+
+
+def apply_lead_overrides(
+    report: DiagnoseReport,
+    overrides: dict[str, int],
+) -> DiagnoseReport:
+    """Return a new DiagnoseReport where lead counts for selected referrals are
+    replaced by the operator's manual values. Recomputes CPL, totals, median,
+    classifier, and pause candidates so downstream steps see consistent data.
+    """
+    if not overrides:
+        return report
+
+    # Step 1 — rewrite per-referral rows with overridden leads + recomputed CPL
+    new_referrals: list[ReferralRow] = []
+    for r in report.referrals:
+        if r.referral in overrides:
+            new_leads = max(0, int(overrides[r.referral]))
+            new_cpl = (r.spend / new_leads) if new_leads > 0 else None
+            new_referrals.append(
+                ReferralRow(
+                    referral=r.referral,
+                    spend=r.spend,
+                    clicks=r.clicks,
+                    real_leads=new_leads,
+                    real_cpl=new_cpl,
+                )
+            )
+        else:
+            new_referrals.append(r)
+    new_referrals.sort(key=lambda r: r.spend, reverse=True)
+
+    # Step 2 — recompute medians used by the classifier
+    cpl_values = [r.real_cpl for r in new_referrals if r.real_cpl is not None]
+    median_cpl = sorted(cpl_values)[len(cpl_values) // 2] if cpl_values else None
+    ctr_values = [a.ctr for a in report.ads if a.spend > 0]
+    median_ctr = sorted(ctr_values)[len(ctr_values) // 2] if ctr_values else 0.0
+
+    real_cpl_by_referral = {r.referral: r.real_cpl for r in new_referrals}
+    real_leads_by_referral = {r.referral: r.real_leads for r in new_referrals}
+
+    # Step 3 — rebuild per-ad rows with the new referral-level leads + recomputed reco
+    new_ads: list[AdRow] = []
+    for a in report.ads:
+        new_real_leads = real_leads_by_referral.get(a.referral, 0)
+        new_real_cpl = real_cpl_by_referral.get(a.referral)
+        new_reco = _classify(
+            spend=a.spend,
+            real_cpl=new_real_cpl,
+            ctr=a.ctr,
+            median_cpl=median_cpl,
+            median_ctr=median_ctr,
+        )
+        new_ads.append(
+            AdRow(
+                ad_id=a.ad_id,
+                name=a.name,
+                status=a.status,
+                referral=a.referral,
+                adset_name=a.adset_name,
+                spend=a.spend,
+                impressions=a.impressions,
+                clicks=a.clicks,
+                ctr=a.ctr,
+                real_leads=new_real_leads,
+                real_cpl=new_real_cpl,
+                landing_link=a.landing_link,
+                recommendation=new_reco,
+            )
+        )
+    new_ads.sort(key=lambda r: r.spend, reverse=True)
+
+    # Step 4 — totals + pause candidates
+    total_spend = sum(r.spend for r in new_referrals)
+    total_leads = sum(r.real_leads for r in new_referrals)
+    avg_cpl = (total_spend / total_leads) if total_leads > 0 else None
+    candidates = [
+        a.ad_id for a in new_ads if a.recommendation == "pause" and a.status == "ACTIVE"
+    ]
+
+    return DiagnoseReport(
+        since=report.since,
+        until=report.until,
+        days=report.days,
+        ads=new_ads,
+        referrals=new_referrals,
+        total_spend=total_spend,
+        total_real_leads=total_leads,
+        avg_real_cpl=avg_cpl,
+        candidate_ads_to_pause=candidates,
+    )
