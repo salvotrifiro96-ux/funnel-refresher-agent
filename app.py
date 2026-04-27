@@ -674,7 +674,9 @@ def _step_creatives() -> None:
                             )
                             st.session_state.creatives[i] = new_creative
                             st.session_state.approvals[i] = True
-                            st.session_state[f"feedback_{i}"] = ""
+                            # Note: don't clear the feedback textarea via session_state —
+                            # Streamlit forbids modifying a widget's state key after render.
+                            # The textarea hides itself on the next rerun (approved=True).
                             st.rerun()
                         except Exception as e:
                             st.error(f"Regen failed: {e}")
@@ -797,12 +799,18 @@ def _step_launch() -> None:
                     help="Visibile in Ads Manager. Default include la data di oggi.",
                 )
                 new_adset_budget = st.number_input(
-                    "Budget giornaliero (€)",
-                    min_value=5.0,
+                    "Budget giornaliero (€) — obbligatorio",
+                    min_value=1.0,
                     max_value=10000.0,
-                    value=30.0,
+                    value=None,
                     step=5.0,
-                    help="Budget dedicato a questo nuovo adset. Se vuoto, copia dall'adset esistente non è supportato in v1 — devi indicarlo.",
+                    placeholder="Es. 30",
+                    help=(
+                        "Quanto vuoi spendere al giorno su questo nuovo adset dedicato. "
+                        "Devi inserire un valore — l'agente non sceglie un default per te. "
+                        "Suggerimento: parti da un budget allineato a quello dell'adset "
+                        "esistente, poi alza se le creative performano."
+                    ),
                 )
                 schedule_cols = st.columns(2)
                 schedule_date = schedule_cols[0].date_input(
@@ -887,18 +895,24 @@ def _step_launch() -> None:
         submitted = st.form_submit_button("📋 Show launch summary", type="primary", use_container_width=True)
 
     if submitted:
-        st.session_state["_launch_form_data"] = {
-            "ads_to_pause": tuple(selected_pause),
-            "untouchable_ad_ids": tuple(selected_untouchable),
-            "create_new_adset": create_new_adset,
-            "new_adset_name": new_adset_name,
-            "new_adset_daily_budget_eur": float(new_adset_budget),
-            "new_adset_start_time_iso": new_adset_start_iso if create_new_adset else "",
-            "new_adset_targeting_note": new_adset_targeting_note,
-            "start_status": start_status,
-            "referral_prefix": referral_prefix.strip(),
-            "cta_type": cta_type,
-        }
+        if create_new_adset and (new_adset_budget is None or new_adset_budget <= 0):
+            st.error(
+                "⚠️ Devi inserire il **Budget giornaliero (€)** per il nuovo adset. "
+                "L'agente non sceglie un default per te."
+            )
+        else:
+            st.session_state["_launch_form_data"] = {
+                "ads_to_pause": tuple(selected_pause),
+                "untouchable_ad_ids": tuple(selected_untouchable),
+                "create_new_adset": create_new_adset,
+                "new_adset_name": new_adset_name,
+                "new_adset_daily_budget_eur": float(new_adset_budget) if new_adset_budget else 0.0,
+                "new_adset_start_time_iso": new_adset_start_iso if create_new_adset else "",
+                "new_adset_targeting_note": new_adset_targeting_note,
+                "start_status": start_status,
+                "referral_prefix": referral_prefix.strip(),
+                "cta_type": cta_type,
+            }
 
     form_data = st.session_state.get("_launch_form_data")
     if form_data:
