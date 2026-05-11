@@ -137,6 +137,17 @@ def _extract_json_array(raw: str) -> list[dict]:
     return json.loads(raw)
 
 
+def _format_brand_colors(colors_hex: dict | None) -> str:
+    if not colors_hex:
+        return ""
+    parts = []
+    for key in ("primary", "secondary", "accent"):
+        val = colors_hex.get(key) if isinstance(colors_hex, dict) else None
+        if val:
+            parts.append(f"{key}={val}")
+    return ", ".join(parts)
+
+
 def generate_copies(
     *,
     api_key: str,
@@ -148,6 +159,9 @@ def generate_copies(
     deadlines: str = "",
     image_constraints: str = "",
     image_text_mode: ImageTextMode = "auto",
+    references: str = "",
+    brand_logo_description: str = "",
+    brand_colors_hex: dict | None = None,
 ) -> list[dict]:
     """Ask Claude for N copy variants for one angle. Returns raw dicts (no image yet)."""
     client = Anthropic(api_key=api_key)
@@ -164,6 +178,24 @@ def generate_copies(
     user_prompt_parts.append(_section("Copy constraints (things to AVOID in the body/headline)", creative_constraints))
     user_prompt_parts.append(_section("Deadlines / urgency to convey", deadlines))
     user_prompt_parts.append(_section("Image constraints (things to AVOID or ALWAYS include in image_prompt)", image_constraints))
+    user_prompt_parts.append(_section("Reference creatives (notes/links/descriptions from operator — study tone and structure, do NOT copy)", references))
+    user_prompt_parts.append(
+        _section(
+            "Brand logo (reserve a small unobtrusive slot in EVERY image_prompt — "
+            "typically bottom-right corner — so the operator can paste the real logo "
+            "in post-production. Do NOT attempt to render the actual logo content; "
+            "image gen models do not reproduce specific logos faithfully)",
+            brand_logo_description,
+        )
+    )
+    palette = _format_brand_colors(brand_colors_hex)
+    user_prompt_parts.append(
+        _section(
+            "Brand color palette (hex codes — anchor the ad's main color zone to these "
+            "while still using a high-contrast accent color to keep ad punchy)",
+            palette,
+        )
+    )
     user_prompt_parts.append(f"\nProduce {n_variants} variants now.")
     user_prompt = "\n".join(user_prompt_parts)
 
@@ -205,6 +237,9 @@ def regenerate_one_variant(
     image_constraints: str = "",
     image_text_mode: ImageTextMode = "auto",
     image_quality: str = "high",
+    references: str = "",
+    brand_logo_description: str = "",
+    brand_colors_hex: dict | None = None,
 ) -> Creative:
     """Regenerate a SINGLE variant given operator feedback. Returns the revised Creative."""
     if not feedback.strip():
@@ -235,6 +270,15 @@ def regenerate_one_variant(
     user_prompt_parts.append(_section("Copy constraints (still apply)", creative_constraints))
     user_prompt_parts.append(_section("Deadlines / urgency (still apply)", deadlines))
     user_prompt_parts.append(_section("Image constraints (still apply)", image_constraints))
+    user_prompt_parts.append(_section("Reference creatives (still apply)", references))
+    user_prompt_parts.append(
+        _section(
+            "Brand logo slot (reserve unobtrusive corner space for post-production logo)",
+            brand_logo_description,
+        )
+    )
+    palette = _format_brand_colors(brand_colors_hex)
+    user_prompt_parts.append(_section("Brand color palette (still apply)", palette))
     user_prompt_parts.append("\nReturn the revised variant as ONE JSON object now.")
     user_prompt = "\n".join(user_prompt_parts)
 
@@ -305,6 +349,9 @@ def generate_creatives(
     deadlines: str = "",
     image_constraints: str = "",
     image_text_mode: ImageTextMode = "auto",
+    references: str = "",
+    brand_logo_description: str = "",
+    brand_colors_hex: dict | None = None,
 ) -> list[Creative]:
     """End-to-end: copies via Claude, then one square image per copy via gpt-image-1."""
     raw_copies = generate_copies(
@@ -317,6 +364,9 @@ def generate_creatives(
         deadlines=deadlines,
         image_constraints=image_constraints,
         image_text_mode=image_text_mode,
+        references=references,
+        brand_logo_description=brand_logo_description,
+        brand_colors_hex=brand_colors_hex,
     )
     creatives: list[Creative] = []
     for c in raw_copies:

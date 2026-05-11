@@ -263,6 +263,64 @@ def _onboarding_sidebar() -> None:
                 height=70,
             )
 
+        with st.expander("🎨 Brand assets (opzionale)", expanded=False):
+            st.caption(
+                "Materiali del brand che entrano nei prompt copy + image gen. "
+                "Tutti i campi opzionali; più precisi sei, più coerenti escono le creative."
+            )
+            references = st.text_area(
+                "Reference creative — link o descrizioni di esempi da studiare",
+                value=brief.get("references", ""),
+                placeholder=(
+                    "Es:\n"
+                    "• https://link-a-creativa-competitor.png — palette gialla, claim corto in alto\n"
+                    "• Stile Apple early-2010: bianco + sans grassetto + product shot centrato\n"
+                    "• Pattern 'PRIMA/DOPO' con timeline orizzontale tipo Skillshare"
+                ),
+                height=110,
+                help=(
+                    "L'agente studia ritmo, struttura e tono dei riferimenti. "
+                    "Non fa copia-incolla — usa per ispirazione strutturale."
+                ),
+            )
+            brand_logo_file = st.file_uploader(
+                "Logo brand (PNG / SVG / JPG)",
+                type=["png", "svg", "jpg", "jpeg"],
+                key="brand_logo_uploader",
+                help=(
+                    "Il logo viene mostrato in anteprima e l'agente lascera uno spazio "
+                    "dedicato per esso nelle creative generate (di solito bottom-right) "
+                    "— ma NON viene replicato fedelmente dal modello image gen. "
+                    "Prevedi di sovrapporre il logo reale in post-produzione."
+                ),
+            )
+            brand_logo_description = st.text_input(
+                "Descrizione breve del logo (per il prompt)",
+                value=brief.get("brand_logo_description", ""),
+                placeholder="Es. 'Logo Leone Master School: leone bianco su sfondo nero, scritta LMS oro'",
+                help=(
+                    "Questa stringa finisce nel prompt image gen come riferimento testuale. "
+                    "Non e' obbligatoria, ma aiuta a 'tenere' lo spazio coerente con il brand."
+                ),
+            )
+            st.markdown("**Palette colori** (entra nei prompt come anchor)")
+            col_p, col_s, col_a = st.columns(3)
+            primary_color = col_p.color_picker(
+                "Primario",
+                value=brief.get("brand_colors_hex", {}).get("primary", "#0A2540"),
+                key="brand_primary",
+            )
+            secondary_color = col_s.color_picker(
+                "Secondario",
+                value=brief.get("brand_colors_hex", {}).get("secondary", "#F4A261"),
+                key="brand_secondary",
+            )
+            accent_color = col_a.color_picker(
+                "Accent",
+                value=brief.get("brand_colors_hex", {}).get("accent", "#E76F51"),
+                key="brand_accent",
+            )
+
         submitted = st.form_submit_button("💾 Save & continue", use_container_width=True)
 
     if submitted:
@@ -291,12 +349,36 @@ def _onboarding_sidebar() -> None:
                 "brand_voice": brand_voice.strip(),
                 "days": days,
             }
+            # Brand assets: preserve previously uploaded logo bytes if the user
+            # didn't re-upload (file_uploader returns None on re-submit)
+            existing_logo_bytes = (st.session_state.get("briefing") or {}).get(
+                "brand_logo_bytes"
+            )
+            existing_logo_name = (st.session_state.get("briefing") or {}).get(
+                "brand_logo_filename"
+            )
+            if brand_logo_file is not None:
+                logo_bytes = brand_logo_file.getvalue()
+                logo_name = brand_logo_file.name
+            else:
+                logo_bytes = existing_logo_bytes
+                logo_name = existing_logo_name
+
             st.session_state.briefing = {
                 "constraints": constraints.strip(),
                 "deadlines": deadlines.strip(),
                 "evergreen": evergreen.strip(),
                 "evergreen_list": _parse_evergreen_list(evergreen),
                 "free_notes": free_notes.strip(),
+                "references": references.strip(),
+                "brand_logo_bytes": logo_bytes,
+                "brand_logo_filename": logo_name,
+                "brand_logo_description": brand_logo_description.strip(),
+                "brand_colors_hex": {
+                    "primary": primary_color,
+                    "secondary": secondary_color,
+                    "accent": accent_color,
+                },
             }
             _log_event(
                 "onboarding_saved",
@@ -646,6 +728,9 @@ def _step_creatives() -> None:
                         deadlines=brief.get("deadlines", ""),
                         image_constraints=image_constraints,
                         image_text_mode=text_mode,
+                        references=brief.get("references", ""),
+                        brand_logo_description=brief.get("brand_logo_description", ""),
+                        brand_colors_hex=brief.get("brand_colors_hex"),
                     )
                     st.session_state.creatives = creatives
                     st.session_state.approvals = [True] * len(creatives)
@@ -735,6 +820,9 @@ def _step_creatives() -> None:
                                 image_constraints=settings.get("image_constraints", ""),
                                 image_text_mode=settings.get("image_text_mode", "auto"),
                                 image_quality=settings.get("image_quality", "high"),
+                                references=brief.get("references", ""),
+                                brand_logo_description=brief.get("brand_logo_description", ""),
+                                brand_colors_hex=brief.get("brand_colors_hex"),
                             )
                             st.session_state.creatives[i] = new_creative
                             st.session_state.approvals[i] = True
