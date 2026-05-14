@@ -23,6 +23,7 @@ from agent.diagnose import DiagnoseReport, apply_lead_overrides, run_diagnosis
 from agent.generate import Creative, generate_creatives, regenerate_one_variant
 from agent.launch import LaunchPlan, launch_refresh
 from agent.meta_api import MetaClient, MetaError
+from agent.orch_link import linked_project_id, save_to_project_button, sidebar_project_picker
 from agent.usage_log import ensure_schema as _ensure_usage_schema, log_event as _log_event
 
 
@@ -405,6 +406,8 @@ def _onboarding_sidebar() -> None:
             st.session_state[k] = DEFAULT_STATE[k]
         st.rerun()
 
+    sidebar_project_picker()
+
 
 # ── Step 0 (welcome) ──────────────────────────────────────────────
 def _step_onboarding() -> None:
@@ -561,6 +564,23 @@ def _step_diagnosis() -> None:
         label_visibility="collapsed",
         key="observations_area",
     )
+
+    # Cross-app: salva diagnosi nel progetto orchestrator
+    if linked_project_id():
+        from dataclasses import asdict as _asdict
+        try:
+            report_dict = _asdict(report)
+        except Exception:
+            report_dict = {"summary": str(report)}
+        save_to_project_button(
+            agent_slug="refresher",
+            output={
+                "report": report_dict,
+                "observations": st.session_state.observations,
+            },
+            label="🎯 Approva diagnosi per progetto",
+            key_suffix="refresher_diagnosis",
+        )
 
     if st.button("➡️ Propose new angles", type="primary"):
         _set_step("angles")
