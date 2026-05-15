@@ -24,6 +24,7 @@ from agent.generate import Creative, generate_creatives, regenerate_one_variant
 from agent.launch import LaunchPlan, launch_refresh
 from agent.meta_api import MetaClient, MetaError
 from agent.orch_link import linked_project_id, save_to_project_button, sidebar_project_picker
+from agent.store import RefreshRow, RefreshStore
 from agent.usage_log import ensure_schema as _ensure_usage_schema, log_event as _log_event
 
 
@@ -91,6 +92,8 @@ DEFAULT_STATE: dict[str, object] = {
     "creative_settings": None,  # n_variants, quality, text_mode, constraints (for regen)
     "launch_result": None,
     "error": None,
+    "loaded_refresh_id": None,
+    "_archive_action": None,
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
@@ -100,6 +103,124 @@ for k, v in DEFAULT_STATE.items():
 def _set_step(new_step: str) -> None:
     st.session_state.step = new_step
     st.session_state.error = None
+
+
+def _store() -> RefreshStore | None:
+    if "_refresh_store" not in st.session_state:
+        try:
+            st.session_state._refresh_store = RefreshStore.from_env()
+        except Exception:
+            st.session_state._refresh_store = None
+    return st.session_state._refresh_store
+
+
+def _archive_save_current() -> None:
+    store = _store()
+    if store is None:
+        return
+    try:
+        saved = store.save_refresh(
+            config=st.session_state.get("config"),
+            briefing=st.session_state.get("briefing"),
+            diagnosis=st.session_state.get("diagnosis"),
+            observations=st.session_state.get("observations") or "",
+            angles=st.session_state.get("angles") or [],
+            chosen_angle_idx=st.session_state.get("chosen_angle_idx"),
+            creatives=st.session_state.get("creatives") or [],
+            approvals=st.session_state.get("approvals") or [],
+            launch_result=st.session_state.get("launch_result"),
+        )
+        st.session_state.loaded_refresh_id = saved.id
+    except Exception as e:
+        st.warning(f"⚠️ Run salvato ma archivio non aggiornato: {e}")
+
+
+def _format_archive_ts(iso_string: str) -> str:
+    try:
+        return datetime.fromisoformat(iso_string.replace("Z", "+00:00")).strftime("%d/%m %H:%M")
+    except Exception:
+        return iso_string[:16]
+
+
+def _render_archive_sidebar() -> None:
+    store = _store()
+    st.sidebar.divider()
+    st.sidebar.header("📚 Archivio refresh")
+    if store is None:
+        st.sidebar.caption(
+            "Archivio disabilitato: mancano `SUPABASE_URL` e `SUPABASE_SECRET_KEY`."
+        )
+        return
+    try:
+        rows = store.list_recent(limit=30)
+    except Exception as e:
+        st.sidebar.error(f"Errore archivio: {e}")
+        return
+    if not rows:
+        st.sidebar.caption("_Nessun refresh salvato ancora._")
+        return
+    if (loaded := st.session_state.get("loaded_refresh_id")):
+        st.sidebar.caption(f"📌 Visualizzo `{loaded[:8]}…`")
+    for row in rows:
+        with st.sidebar.expander(f"{_format_archive_ts(row.created_at)} — {row.title[:60]}"):
+            lr = row.payload.get("launch_result") or {}
+            created = len((lr.get("created") or []))
+            paused = len((lr.get("paused") or []))
+            st.caption(
+                f"id: `{row.id[:8]}…` · "
+                f"{'🚀 launched' if created or paused else '⏳ in-progress'} "
+                f"(▶ {created}, ⏸ {paused})"
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("📥 Apri", key=f"open_{row.id}", use_container_width=True):
+                st.session_state._archive_action = {"kind": "load", "id": row.id}
+                st.rerun()
+            if c2.button("🗑", key=f"del_{row.id}", use_container_width=True):
+                st.session_state._archive_action = {"kind": "delete", "id": row.id}
+                st.rerun()
+
+
+def _apply_archive_action() -> None:
+    action = st.session_state.pop("_archive_action", None)
+    if not action:
+        return
+    store = _store()
+    if store is None:
+        return
+    try:
+        if action["kind"] == "load":
+            row = store.get(action["id"])
+            if row is None:
+                st.warning("Refresh non trovato in archivio.")
+                return
+            p = row.payload
+            # Config: senza secrets — l'utente deve reinserirli per rilanciare,
+            # ma può rivedere la storia.
+            st.session_state.config = p.get("config") or {}
+            st.session_state.briefing = p.get("briefing") or {}
+            st.session_state.diagnosis = p.get("diagnosis")  # già dict
+            st.session_state.observations = p.get("observations") or ""
+            st.session_state.angles = p.get("angles") or []
+            st.session_state.chosen_angle_idx = p.get("chosen_angle_idx")
+            st.session_state.creatives = p.get("creatives") or []
+            st.session_state.approvals = p.get("approvals") or []
+            st.session_state.launch_result = p.get("launch_result")
+            st.session_state.loaded_refresh_id = row.id
+            # Vai a "done" se c'è launch_result, altrimenti al primo step utile
+            if (p.get("launch_result") or {}).get("created") is not None:
+                st.session_state.step = "done"
+            elif p.get("creatives"):
+                st.session_state.step = "creatives"
+            elif p.get("angles"):
+                st.session_state.step = "angles"
+            else:
+                st.session_state.step = "onboarding"
+        elif action["kind"] == "delete":
+            store.delete(action["id"])
+            if st.session_state.get("loaded_refresh_id") == action["id"]:
+                st.session_state.loaded_refresh_id = None
+    except Exception as e:
+        st.warning(f"Archivio: {e}")
 
 
 def _show_error_if_any() -> None:
@@ -407,6 +528,8 @@ def _onboarding_sidebar() -> None:
         st.rerun()
 
     sidebar_project_picker()
+    _render_archive_sidebar()
+    _apply_archive_action()
 
 
 # ── Step 0 (welcome) ──────────────────────────────────────────────
@@ -1147,6 +1270,7 @@ def _step_launch() -> None:
                     )
                     st.session_state.launch_result = result
                     st.session_state["_launch_form_data"] = None
+                    _archive_save_current()
                     _log_event(
                         "launch_executed",
                         meta_account=cfg["meta_account"],
